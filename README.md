@@ -22,7 +22,7 @@ operations, derived tables, `USING`, `PIVOT`, `UNNEST`, lateral views.
 | Language | Package |
 | --- | --- |
 | Rust | `cargo add sqlscope` |
-| Python | `pip install sqlscope` (wheels for Linux, macOS, Windows; Python ≥ 3.9) |
+| Python | `pip install sqlscope-rs` (imported as `sqlscope`; wheels for Linux, macOS, Windows; Python ≥ 3.9) |
 | Go | `go get github.com/dcalsky/sqlscope/go` (pure Go, no cgo) |
 
 ## Usage
@@ -164,28 +164,6 @@ Rewrites regenerate SQL from the AST (normalized formatting, comments
 removed, optimizer hints kept) and verify that the output parses before
 returning it; when nothing needs rewriting, the input is returned unchanged.
 
-## Migrating from easysql
-
-| easysql (Go) | sqlscope |
-| --- | --- |
-| `WithDialect`, `WithBindCTEDialect`, `WithLineageDialect`, `WithRewriteDialect` | `WithDialect` (one shared `Option`) |
-| `WithLineageMetadata` | `WithSchema` |
-| `WithSelfCheck` | removed (output is always verified) |
-| `WithLineageProducer`, `WithLineageNamespace` | removed (did not affect results) |
-| `StripMatchCatalogs` | `WithStripCatalogs` |
-| `BindCTEs` / `CTEBinding` | `InjectCTEs` / `CTEDef` |
-| `RewriteTableReferences` | `RewriteTables` |
-| `LineageSourceColumns`, `LineageSourceColumnsConcurrent` | `ColumnOrigins` |
-| `ParseColumns` | `OutputColumns` |
-| `ReferencedColumnUsages` / `ColumnUse` | `ColumnUsages` / `ColumnUsage` |
-| `ApplyRowFilter`, `ReferencedColumns` | unchanged |
-
-Behavior changes: the default dialect is `trino` for every operation
-(`ApplyRowFilter` previously defaulted to `mysql`); every polyglot dialect is
-accepted; invalid table names in `WithTableNames` are errors instead of being
-ignored; and errors also carry `ErrInvalidArgument` for configuration
-mistakes.
-
 ## Development
 
 ```bash
@@ -199,6 +177,12 @@ scripts/build-wasm.sh && (cd go && go test ./...)     # Go
 `go/internal/wasm/sqlscope.wasm.gz`, which is committed so `go get` works. CI
 rebuilds it on every run, tests the Go SDK against the fresh build, and on
 `main` commits it back when it changed.
+
+To release, bump `version` in the root `Cargo.toml`, wait for CI on `main`
+to finish (it may commit an updated engine), then tag that commit:
+`git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow runs CI,
+publishes the wheels to PyPI, tags the Go module as `go/vX.Y.Z` and attaches
+the wheels, sdist and WebAssembly engine to a GitHub release.
 
 ## License
 

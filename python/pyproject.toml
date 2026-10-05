@@ -3,7 +3,7 @@ requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
-name = "sqlscope"
+name = "sqlscope-rs"
 description = "Scope-aware SQL analysis and rewriting: row filters, CTE injection, table rewrites, column lineage."
 readme = "README.md"
 license = "MIT"

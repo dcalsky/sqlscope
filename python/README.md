@@ -4,7 +4,7 @@ Scope-aware SQL analysis and rewriting, backed by the Rust
 [sqlscope](https://github.com/dcalsky/sqlscope) crate.
 
 ```bash
-pip install sqlscope
+pip install sqlscope-rs
 ```
 
 ```python

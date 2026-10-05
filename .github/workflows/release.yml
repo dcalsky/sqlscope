@@ -1,9 +1,16 @@
 name: Release
 
-# Pushing a tag vX.Y.Z builds Python wheels for every platform and attaches
-# them and the WebAssembly engine to a GitHub release. Publishing to PyPI
-# (trusted publishing) and crates.io (CARGO_REGISTRY_TOKEN) runs only when
-# those are configured. The Go module is versioned by a go/vX.Y.Z tag.
+# Pushing a tag vX.Y.Z (matching the workspace version) runs the full CI
+# suite, then:
+#   - builds Python wheels for every platform plus an sdist and publishes
+#     them to PyPI as `sqlscope-rs` (trusted publishing, `pypi` environment);
+#   - builds the WebAssembly engine and checks it matches the one committed
+#     for the Go SDK;
+#   - creates a GitHub release with the wheels, sdist, engine and checksums;
+#   - tags the Go module as go/vX.Y.Z;
+#   - publishes the crate to crates.io when vars.PUBLISH_CRATES is 'true'.
+# Running it manually (workflow_dispatch) builds everything without
+# publishing.
 
 on:
   push:
@@ -13,19 +20,47 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read workspace version
+        id: version
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+
+  ci:
+    name: CI
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: write
+
   wheels:
-    name: Wheels (${{ matrix.target }})
+    name: Wheels (${{ matrix.name }})
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
-          - { os: ubuntu-latest, target: aarch64, manylinux: auto }
-          - { os: macos-latest, target: x86_64 }
-          - { os: macos-latest, target: aarch64 }
-          - { os: windows-latest, target: x64 }
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: "2014" }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64, manylinux: "2014" }
+          - { name: macos-x86_64, os: macos-15-intel, target: x86_64-apple-darwin }
+          - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,12 +72,30 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
+      # Every runner is native to its target, so each wheel is installed and
+      # exercised before it can be published.
+      - name: Smoke test
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          python -m pip install --no-index --find-links python/dist "sqlscope-rs==$VERSION"
+          python - <<'PY'
+          import os
+          import sqlscope
+          assert sqlscope.__version__ == os.environ["VERSION"], sqlscope.__version__
+          assert sqlscope.apply_row_filter("SELECT id FROM orders", "tenant_id = 7") == (
+              "SELECT id FROM (SELECT * FROM orders WHERE tenant_id = 7) AS orders"
+          )
+          PY
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          name: python-${{ matrix.name }}
           path: python/dist
 
   sdist:
+    name: Python sdist
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,46 +106,120 @@ jobs:
           args: --out dist
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-sdist
+          name: python-sdist
           path: python/dist
 
-  github-release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [wheels, sdist]
+  wasm:
+    name: WebAssembly engine
+    needs: version
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          pattern: wheels-*
-          merge-multiple: true
-          path: dist
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          targets: wasm32-wasip1
+      - name: Build
         run: |
-          gh release create "$GITHUB_REF_NAME" --generate-notes \
-            dist/* go/internal/wasm/sqlscope.wasm.gz
+          cp go/internal/wasm/sqlscope.wasm.gz /tmp/committed.wasm.gz
+          scripts/build-wasm.sh
+      # The Go module serves the committed engine, so the tagged commit must
+      # already carry the engine built from its sources (CI commits it to
+      # main; tag after that commit).
+      - name: Check committed engine
+        run: |
+          if ! cmp -s <(gunzip -c /tmp/committed.wasm.gz) <(gunzip -c go/internal/wasm/sqlscope.wasm.gz); then
+            echo "::error::go/internal/wasm/sqlscope.wasm.gz is stale; wait for CI to update it on main and tag that commit"
+            exit 1
+          fi
+      - name: Package
+        run: |
+          mkdir dist
+          cp go/internal/wasm/sqlscope.wasm.gz dist/
+          cp target/wasm32-wasip1/wasm/sqlscope_wasm.wasm dist/sqlscope.wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-wasm
+          path: dist
 
   pypi:
-    if: startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_PYPI == 'true'
-    needs: [wheels, sdist]
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, ci, wheels, sdist]
     runs-on: ubuntu-latest
-    environment: pypi
+    environment:
+      name: pypi
+      url: https://pypi.org/p/sqlscope-rs
     permissions:
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
+          pattern: python-*
           merge-multiple: true
           path: dist
+      - name: Check artifact versions
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls dist
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              sqlscope_rs-"$VERSION"-*.whl | sqlscope_rs-"$VERSION".tar.gz) ;;
+              *) echo "::error::unexpected artifact $f"; exit 1 ;;
+            esac
+          done
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  github-release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ci, wheels, sdist, wasm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: python-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-wasm
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > checksums.sha256
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+
+  go-tag:
+    name: Tag Go module
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ci, wasm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create go/${{ github.ref_name }}
+        run: |
+          tag="go/$GITHUB_REF_NAME"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists"
+            exit 0
+          fi
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+
   crates-io:
-    if: startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_CRATES == 'true'
+    name: Publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_CRATES == 'true'
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
