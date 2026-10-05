@@ -196,8 +196,9 @@ scripts/build-wasm.sh && (cd go && go test ./...)     # Go
 ```
 
 `scripts/build-wasm.sh` needs the `wasm32-wasip1` Rust target and regenerates
-`go/internal/wasm/sqlscope.wasm.gz`, which is committed so `go get` works; CI
-checks that it matches the sources.
+`go/internal/wasm/sqlscope.wasm.gz`, which is committed so `go get` works. CI
+rebuilds it on every run, tests the Go SDK against the fresh build, and on
+`main` commits it back when it changed.
 
 ## License
 

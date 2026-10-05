@@ -46,7 +46,7 @@ pub fn has_unaliased_derived_table(sql: &str, dialect: &str) -> bool {
             .iter()
             .flat_map(|f| f.expressions.iter())
             .chain(select.joins.iter().map(|j| &j.this))
-            .any(|entry| matches!(entry, Expression::Subquery(sub) if sub.alias.as_ref().map_or(true, |a| a.name.is_empty()))),
+            .any(|entry| matches!(entry, Expression::Subquery(sub) if sub.alias.as_ref().is_none_or(|a| a.name.is_empty()))),
         _ => false,
     })
 }
