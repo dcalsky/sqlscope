@@ -1,0 +1,23 @@
+[package]
+name = "sqlscope"
+description = "Scope-aware SQL analysis and rewriting: row filters, CTE injection, table rewrites, column lineage and references."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords = ["sql", "lineage", "parser", "row-level-security", "polyglot"]
+categories = ["parser-implementations", "database"]
+readme = "../../README.md"
+
+[features]
+default = ["stacker"]
+# Grow the native stack on deep parser recursion. Disable for wasm targets.
+stacker = ["polyglot-sql/stacker"]
+
+[dependencies]
+polyglot-sql = { workspace = true, features = ["all-dialects", "generate", "ast-tools", "semantic", "openlineage"] }
+regex.workspace = true
+serde_json.workspace = true

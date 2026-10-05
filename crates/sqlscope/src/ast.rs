@@ -1,0 +1,341 @@
+//! Shared helpers over the polyglot typed AST.
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::mem::{discriminant, Discriminant};
+
+use polyglot_sql::expressions::{Identifier, TableRef, With};
+use polyglot_sql::{traversal::transform_all, Expression, ExpressionWalk};
+
+use crate::error::{Error, Result};
+use crate::options::Dialect;
+
+/// Upper bound on any SQL text accepted or produced, independent of the
+/// parser's own complexity guards.
+pub(crate) const MAX_INPUT_BYTES: usize = 1 << 20;
+
+pub(crate) fn guard_input(sql: &str) -> Result<()> {
+    if sql.len() > MAX_INPUT_BYTES {
+        return Err(Error::unsupported(format!(
+            "input too large ({} bytes, limit {MAX_INPUT_BYTES})",
+            sql.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Maps a polyglot parse failure to [`Error`]. Complexity-guard rejections
+/// (`E_GUARD_*`) are bounded-input failures and classify as unsupported.
+fn classify_parse_error(error: polyglot_sql::Error) -> Error {
+    let message = error.to_string();
+    if message.contains("E_GUARD_") {
+        Error::unsupported(message)
+    } else {
+        Error::parse(message)
+    }
+}
+
+/// Parses `sql` into its statements.
+pub(crate) fn parse(sql: &str, dialect: Dialect) -> Result<Vec<Expression>> {
+    guard_input(sql)?;
+    polyglot_sql::parse(sql, dialect.polyglot()).map_err(classify_parse_error)
+}
+
+/// Parses `sql`, which must contain exactly one statement.
+pub(crate) fn parse_single(sql: &str, dialect: Dialect) -> Result<Expression> {
+    let mut statements = parse(sql, dialect)?;
+    if statements.len() != 1 {
+        return Err(Error::unsupported(format!(
+            "expected exactly one statement, got {}",
+            statements.len()
+        )));
+    }
+    Ok(statements.remove(0))
+}
+
+/// Parses `sql`, which must be a single SELECT or set operation.
+pub(crate) fn parse_query(sql: &str, dialect: Dialect) -> Result<Expression> {
+    let statement = parse_single(sql, dialect)?;
+    if !is_query(&statement) {
+        return Err(Error::unsupported(
+            "only a SELECT or set operation (UNION / INTERSECT / EXCEPT) is supported",
+        ));
+    }
+    Ok(statement)
+}
+
+/// Renders `expression` as SQL.
+pub(crate) fn generate(expression: &Expression, dialect: Dialect) -> Result<String> {
+    polyglot_sql::generate(expression, dialect.polyglot())
+        .map_err(|error| Error::internal(format!("SQL generation failed: {error}")))
+}
+
+/// Renders a rewritten statement and proves that the output parses again, so
+/// a rewrite either yields valid SQL or fails closed.
+pub(crate) fn generate_checked(expression: &Expression, dialect: Dialect) -> Result<String> {
+    let sql = generate(expression, dialect)?;
+    guard_input(&sql).map_err(|error| error.context("generated SQL"))?;
+    if let Err(error) = polyglot_sql::parse(&sql, dialect.polyglot()) {
+        return Err(Error::internal(format!(
+            "rewritten SQL does not parse: {error}; SQL: {sql}"
+        )));
+    }
+    Ok(sql)
+}
+
+pub(crate) fn is_query(expression: &Expression) -> bool {
+    matches!(
+        expression,
+        Expression::Select(_) | Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
+    )
+}
+
+/// The WITH clause attached to a query node.
+pub(crate) fn query_with(expression: &Expression) -> Option<&With> {
+    match expression {
+        Expression::Select(select) => select.with.as_ref(),
+        Expression::Union(op) => op.with.as_ref(),
+        Expression::Intersect(op) => op.with.as_ref(),
+        Expression::Except(op) => op.with.as_ref(),
+        _ => None,
+    }
+}
+
+pub(crate) fn query_with_mut(expression: &mut Expression) -> Option<&mut Option<With>> {
+    match expression {
+        Expression::Select(select) => Some(&mut select.with),
+        Expression::Union(op) => Some(&mut op.with),
+        Expression::Intersect(op) => Some(&mut op.with),
+        Expression::Except(op) => Some(&mut op.with),
+        _ => None,
+    }
+}
+
+/// Finds the query a statement wraps: the statement itself for a SELECT or set
+/// operation, or the query of CREATE VIEW / CREATE TABLE AS / INSERT ...
+/// SELECT / EXPLAIN / CACHE TABLE and similar wrappers. `None` means the
+/// statement contains no query (for example CREATE TABLE (...) or DROP).
+pub(crate) fn inner_query(statement: &Expression) -> Option<&Expression> {
+    if is_query(statement) {
+        return Some(statement);
+    }
+    match statement {
+        Expression::Subquery(subquery) if is_query(&subquery.this) => Some(&subquery.this),
+        Expression::Paren(paren) => inner_query(&paren.this),
+        // DML statements are handled structurally; their nested queries
+        // (WHERE subqueries, MERGE sources) are not "the" query.
+        Expression::Update(_) | Expression::Delete(_) | Expression::Merge(_) => None,
+        _ => statement.children().into_iter().find_map(|child| {
+            if is_query(child) {
+                Some(child)
+            } else if let Expression::Subquery(subquery) = child {
+                is_query(&subquery.this).then_some(&subquery.this)
+            } else {
+                None
+            }
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Identifiers
+// ---------------------------------------------------------------------------
+
+/// Whether a caller-supplied identifier must be quoted to keep its exact
+/// value: anything other than a simple lower-case identifier. Mixed or upper
+/// case is quoted because folding dialects would otherwise change it.
+pub(crate) fn needs_quote(name: &str) -> bool {
+    let mut chars = name.chars();
+    let simple = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    !simple || name.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// An identifier node for a caller-supplied name.
+pub(crate) fn ident(name: &str) -> Identifier {
+    ident_with(name, needs_quote(name))
+}
+
+pub(crate) fn ident_with(name: &str, quoted: bool) -> Identifier {
+    if quoted {
+        Identifier::quoted(name)
+    } else {
+        Identifier::new(name)
+    }
+}
+
+/// The comparison key for an identifier: SQL folds only unquoted names, so
+/// quoted identifiers compare exactly and unquoted ones case-insensitively.
+pub(crate) fn ident_key(identifier: &Identifier) -> String {
+    if identifier.quoted {
+        identifier.name.clone()
+    } else {
+        identifier.name.to_lowercase()
+    }
+}
+
+/// The name of an optional identifier, or `""`.
+pub(crate) fn opt_name(identifier: &Option<Identifier>) -> &str {
+    identifier.as_ref().map_or("", |i| i.name.as_str())
+}
+
+/// `catalog.schema.table` as written (without quotes), omitting absent parts.
+pub(crate) fn qualified_name(table: &TableRef) -> String {
+    let mut parts = Vec::with_capacity(3);
+    for identifier in [&table.catalog, &table.schema].into_iter().flatten() {
+        if !identifier.name.is_empty() {
+            parts.push(identifier.name.as_str());
+        }
+    }
+    parts.push(table.name.name.as_str());
+    parts.join(".")
+}
+
+/// Whether `qualified` names the table `reference` on a dot boundary: equal,
+/// or `qualified` ends with `.reference`. `raw.orders` matches
+/// `hive.raw.orders` but not `hive.braw.orders`.
+pub(crate) fn has_table_suffix(qualified: &str, reference: &str) -> bool {
+    if reference.is_empty() {
+        return false;
+    }
+    qualified == reference
+        || (qualified.len() > reference.len()
+            && qualified.ends_with(reference)
+            && qualified.as_bytes()[qualified.len() - reference.len() - 1] == b'.')
+}
+
+pub(crate) fn table_names_match(a: &str, b: &str) -> bool {
+    has_table_suffix(a, b) || has_table_suffix(b, a)
+}
+
+// ---------------------------------------------------------------------------
+// Node identities and post-order edits
+// ---------------------------------------------------------------------------
+
+/// Stable identities for the nodes of an immutable tree.
+///
+/// Analysis passes borrow the tree and refer to nodes by address; [`NodeIds`]
+/// translates those addresses into post-order positions, which is exactly
+/// the order in which [`transform_all`] visits nodes. Edits planned against a
+/// borrowed tree can therefore be applied to the owned tree afterwards.
+pub(crate) struct NodeIds {
+    ids: HashMap<*const Expression, usize>,
+    kinds: Vec<Discriminant<Expression>>,
+}
+
+impl NodeIds {
+    pub(crate) fn new(root: &Expression) -> Self {
+        let mut ids = HashMap::new();
+        let mut kinds = Vec::new();
+        // Iterative post-order: (node, children already expanded).
+        let mut stack: Vec<(&Expression, bool)> = vec![(root, false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                ids.insert(node as *const Expression, kinds.len());
+                kinds.push(discriminant(node));
+                continue;
+            }
+            stack.push((node, true));
+            let children = node.children();
+            for child in children.into_iter().rev() {
+                stack.push((child, false));
+            }
+        }
+        Self { ids, kinds }
+    }
+
+    pub(crate) fn id(&self, node: &Expression) -> Option<usize> {
+        self.ids.get(&(node as *const Expression)).copied()
+    }
+}
+
+type Edit = Box<dyn FnOnce(Expression) -> Result<Expression>>;
+
+/// A set of node replacements planned against a borrowed tree.
+#[derive(Default)]
+pub(crate) struct Edits {
+    edits: HashMap<usize, Edit>,
+}
+
+impl Edits {
+    /// Plans replacing `node` (a node of the tree `ids` was built from).
+    pub(crate) fn replace(
+        &mut self,
+        ids: &NodeIds,
+        node: &Expression,
+        edit: impl FnOnce(Expression) -> Result<Expression> + 'static,
+    ) -> Result<()> {
+        let id = ids
+            .id(node)
+            .ok_or_else(|| Error::internal("edit target is not part of the statement"))?;
+        if self.edits.insert(id, Box::new(edit)).is_some() {
+            return Err(Error::internal("conflicting edits for one AST node"));
+        }
+        Ok(())
+    }
+
+    /// Applies the edits to the tree `ids` was built from. Fails closed if the
+    /// traversal does not line up with the planned node identities.
+    pub(crate) fn apply(self, root: Expression, ids: &NodeIds) -> Result<Expression> {
+        let position = Cell::new(0usize);
+        let edits = RefCell::new(self.edits);
+        let failure = RefCell::new(None::<Error>);
+        let result = transform_all(root, &|node| {
+            let id = position.get();
+            position.set(id + 1);
+            if ids.kinds.get(id) != Some(&discriminant(&node)) {
+                failure.replace(Some(Error::internal("AST traversal order mismatch")));
+                return Ok(node);
+            }
+            let Some(edit) = edits.borrow_mut().remove(&id) else {
+                return Ok(node);
+            };
+            match edit(node) {
+                Ok(replacement) => Ok(replacement),
+                Err(error) => {
+                    failure.replace(Some(error));
+                    Ok(Expression::Null(polyglot_sql::expressions::Null))
+                }
+            }
+        })
+        .map_err(|error| Error::internal(format!("AST transform failed: {error}")))?;
+        if let Some(error) = failure.into_inner() {
+            return Err(error);
+        }
+        if position.get() != ids.kinds.len() || !edits.borrow().is_empty() {
+            return Err(Error::internal("AST traversal did not visit every planned edit"));
+        }
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Comments
+// ---------------------------------------------------------------------------
+
+/// Drops every comment attached to the tree so regenerated SQL carries none.
+///
+/// Comments live in many differently named `*_comments` fields across the
+/// typed AST; a structural round trip through its serialized form clears all
+/// of them without touching string literals.
+pub(crate) fn strip_comments(expression: Expression) -> Result<Expression> {
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    if key.ends_with("comments") && child.is_array() {
+                        *child = serde_json::Value::Array(Vec::new());
+                    } else {
+                        strip(child);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut value =
+        serde_json::to_value(&expression).map_err(|error| Error::internal(format!("serialize AST: {error}")))?;
+    strip(&mut value);
+    serde_json::from_value(value).map_err(|error| Error::internal(format!("deserialize AST: {error}")))
+}
