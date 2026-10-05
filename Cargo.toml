@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/sqlscope"]
-default-members = ["crates/sqlscope"]
+members = ["crates/sqlscope", "crates/sqlscope-wasm", "python"]
+default-members = ["crates/sqlscope", "crates/sqlscope-wasm", "python"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,3 +21,10 @@ regex = "1"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Size-optimized build of the WebAssembly module embedded in the Go SDK.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+strip = true
+panic = "abort"

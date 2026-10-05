@@ -7,7 +7,7 @@ use regex::Regex;
 
 use crate::ast::{self, opt_name};
 use crate::error::{Error, Result};
-use crate::normalize::normalize;
+use crate::normalize::prepare_rewrite;
 use crate::options::{Dialect, Options};
 use crate::rewrite::{derived_table, rewrite_statement, select_from, star, unaliased, AliasRef, Replacement};
 
@@ -51,14 +51,14 @@ pub fn apply_row_filter(sql: &str, predicate: &str, options: &Options) -> Result
     let scope = TableScope::compile(options)?;
     let predicate = parse_predicate(predicate, dialect)?;
 
-    let normalized = normalize(sql, dialect);
+    let normalized = prepare_rewrite(sql, dialect);
     let statement = ast::parse_query(&normalized, dialect)?;
     let filter = RowFilter {
         predicate: Arc::new(predicate),
     };
     match rewrite_statement(statement, |table| scope.contains(table).then(|| filter.clone()))? {
         None => Ok(sql.to_owned()),
-        Some(rewritten) => ast::generate_checked(&ast::strip_comments(rewritten)?, dialect),
+        Some(rewritten) => ast::generate_checked(&rewritten, dialect),
     }
 }
 
@@ -84,6 +84,7 @@ impl Replacement for RowFilter {
 
 /// Parses `text` as exactly one boolean expression.
 fn parse_predicate(text: &str, dialect: Dialect) -> Result<Expression> {
+    let text = crate::normalize::strip_comments(text, dialect);
     let text = text.trim();
     if text.is_empty() {
         return Err(Error::invalid("predicate must not be empty"));

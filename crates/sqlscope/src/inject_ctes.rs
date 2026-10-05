@@ -4,7 +4,7 @@ use polyglot_sql::expressions::{Cte, With};
 
 use crate::ast::{self, ident, ident_key, query_with_mut, MAX_INPUT_BYTES};
 use crate::error::{Error, Result};
-use crate::normalize::normalize;
+use crate::normalize::prepare_rewrite;
 use crate::options::Options;
 
 /// A common table expression to inject: `name AS (query)`.
@@ -76,7 +76,8 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
         }
     }
 
-    let mut consumer = ast::parse_query(&normalize(sql, dialect), dialect).map_err(|error| error.context("query"))?;
+    let mut consumer =
+        ast::parse_query(&prepare_rewrite(sql, dialect), dialect).map_err(|error| error.context("query"))?;
     let slot = query_with_mut(&mut consumer).ok_or_else(|| Error::internal("query has no WITH slot"))?;
     if let Some(existing) = slot {
         for cte in &existing.ctes {
@@ -92,7 +93,7 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
     let mut injected = Vec::with_capacity(ctes.len());
     for cte in ctes {
         let name = cte.name.trim();
-        let query = ast::parse_query(&normalize(&cte.query, dialect), dialect)
+        let query = ast::parse_query(&prepare_rewrite(&cte.query, dialect), dialect)
             .map_err(|error| error.context(format!("CTE {name:?}")))?;
         injected.push(Cte {
             alias: ident(name),
@@ -119,7 +120,7 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
             })
         }
     }
-    ast::generate_checked(&ast::strip_comments(consumer)?, dialect)
+    ast::generate_checked(&consumer, dialect)
 }
 
 /// Duplicate detection key: simple names compare like unquoted SQL names

@@ -29,22 +29,6 @@ pub(crate) fn columns<'s>(schema: &'s Schema, table: &str) -> Option<&'s [String
     key_for(schema, table).map(|key| schema[key].as_slice())
 }
 
-/// The subset of `schema` describing `sources`, so entries for unrelated
-/// tables cannot influence analysis. A source without an entry is listed with
-/// no columns.
-pub(crate) fn restrict_to(schema: &Schema, sources: &[String]) -> Schema {
-    if schema.is_empty() || sources.is_empty() {
-        return schema.clone();
-    }
-    sources
-        .iter()
-        .map(|source| match key_for(schema, source) {
-            Some(key) => (key.clone(), schema[key].clone()),
-            None => (source.clone(), Vec::new()),
-        })
-        .collect()
-}
-
 /// Converts the schema into polyglot's validation schema. A dotted name is
 /// split at its last dot: `hive.raw.orders` is table `orders` in schema
 /// `hive.raw`.

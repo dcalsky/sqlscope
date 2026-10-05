@@ -69,3 +69,29 @@ fn dialect_names() {
     assert_eq!(Dialect::default(), Dialect::TRINO);
     assert_eq!("pg".parse::<Dialect>().unwrap().to_string(), "postgresql");
 }
+
+/// Nesting well within the documented limits works for every operation (the
+/// WebAssembly build must accept the same inputs as native builds).
+#[test]
+fn moderately_deep_queries_are_accepted() {
+    let mut nested = "SELECT a FROM t".to_string();
+    for i in 0..120 {
+        nested = format!("SELECT a FROM ({nested}) x{i}");
+    }
+    let parens = format!("SELECT {}a{} AS a FROM t", "(".repeat(200), ")".repeat(200));
+    let opts = Options::new();
+    for sql in [nested, parens] {
+        apply_row_filter(&sql, "x = 1", &opts).unwrap();
+        rewrite_tables(
+            &sql,
+            &[TableRewrite::inline("s.t", TableRef::new("t").with_schema("u"))],
+            &opts,
+        )
+        .unwrap();
+        inject_ctes(&sql, &[CteDef::new("c", "SELECT 1")], &opts).unwrap();
+        assert_eq!(column_origins(&sql, &opts).unwrap()["t"], ["a"]);
+        assert_eq!(output_columns(&sql, &opts).unwrap().unwrap(), ["a"]);
+        assert_eq!(referenced_columns(&sql, &opts).unwrap()["t"], ["a"]);
+        assert!(!column_usages(&sql, &opts).unwrap().is_empty());
+    }
+}

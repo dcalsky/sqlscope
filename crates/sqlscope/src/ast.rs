@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::mem::{discriminant, Discriminant};
 
 use polyglot_sql::expressions::{Identifier, TableRef, With};
-use polyglot_sql::{traversal::transform_all, Expression, ExpressionWalk};
+use polyglot_sql::{traversal::transform_all, ComplexityGuardOptions, Expression, ExpressionWalk, ParseOptions};
 
 use crate::error::{Error, Result};
 use crate::options::Dialect;
@@ -35,10 +35,23 @@ fn classify_parse_error(error: polyglot_sql::Error) -> Error {
     }
 }
 
+/// Parser recursion limit. Set explicitly so every build target (native and
+/// WebAssembly, whose polyglot defaults differ) accepts the same inputs.
+pub(crate) const MAX_PARSER_DEPTH: usize = 256;
+
+fn parse_options() -> ParseOptions {
+    ParseOptions {
+        complexity_guard: Some(ComplexityGuardOptions {
+            max_parser_depth: Some(MAX_PARSER_DEPTH),
+            ..ComplexityGuardOptions::default()
+        }),
+    }
+}
+
 /// Parses `sql` into its statements.
 pub(crate) fn parse(sql: &str, dialect: Dialect) -> Result<Vec<Expression>> {
     guard_input(sql)?;
-    polyglot_sql::parse(sql, dialect.polyglot()).map_err(classify_parse_error)
+    polyglot_sql::parse_with_options(sql, dialect.polyglot(), &parse_options()).map_err(classify_parse_error)
 }
 
 /// Parses `sql`, which must contain exactly one statement.
@@ -66,7 +79,8 @@ pub(crate) fn parse_query(sql: &str, dialect: Dialect) -> Result<Expression> {
 
 /// Renders `expression` as SQL.
 pub(crate) fn generate(expression: &Expression, dialect: Dialect) -> Result<String> {
-    polyglot_sql::generate(expression, dialect.polyglot())
+    // The generator recurses without growing the stack itself.
+    with_large_stack(|| polyglot_sql::generate(expression, dialect.polyglot()))
         .map_err(|error| Error::internal(format!("SQL generation failed: {error}")))
 }
 
@@ -75,7 +89,7 @@ pub(crate) fn generate(expression: &Expression, dialect: Dialect) -> Result<Stri
 pub(crate) fn generate_checked(expression: &Expression, dialect: Dialect) -> Result<String> {
     let sql = generate(expression, dialect)?;
     guard_input(&sql).map_err(|error| error.context("generated SQL"))?;
-    if let Err(error) = polyglot_sql::parse(&sql, dialect.polyglot()) {
+    if let Err(error) = polyglot_sql::parse_with_options(&sql, dialect.polyglot(), &parse_options()) {
         return Err(Error::internal(format!(
             "rewritten SQL does not parse: {error}; SQL: {sql}"
         )));
@@ -134,6 +148,35 @@ pub(crate) fn inner_query(statement: &Expression) -> Option<&Expression> {
                 None
             }
         }),
+    }
+}
+
+/// Runs `f`, first growing the stack when little of it is left. Wraps every
+/// recursive AST walk so deep (but parser-accepted) input cannot overflow
+/// native stacks. Without the `stacker` feature (WebAssembly) the module's
+/// stack is sized for the parser's depth limit instead.
+#[inline]
+pub(crate) fn with_stack<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "stacker")]
+    {
+        stacker::maybe_grow(128 * 1024, 4 * 1024 * 1024, f)
+    }
+    #[cfg(not(feature = "stacker"))]
+    {
+        f()
+    }
+}
+
+/// Runs `f` on a fresh, large stack segment (native builds) for library
+/// calls that recurse deeply without growing the stack themselves.
+pub(crate) fn with_large_stack<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "stacker")]
+    {
+        stacker::maybe_grow(8 * 1024 * 1024, 64 * 1024 * 1024, f)
+    }
+    #[cfg(not(feature = "stacker"))]
+    {
+        f()
     }
 }
 
@@ -307,35 +350,4 @@ impl Edits {
         }
         Ok(result)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Comments
-// ---------------------------------------------------------------------------
-
-/// Drops every comment attached to the tree so regenerated SQL carries none.
-///
-/// Comments live in many differently named `*_comments` fields across the
-/// typed AST; a structural round trip through its serialized form clears all
-/// of them without touching string literals.
-pub(crate) fn strip_comments(expression: Expression) -> Result<Expression> {
-    fn strip(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                for (key, child) in map.iter_mut() {
-                    if key.ends_with("comments") && child.is_array() {
-                        *child = serde_json::Value::Array(Vec::new());
-                    } else {
-                        strip(child);
-                    }
-                }
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
-            _ => {}
-        }
-    }
-    let mut value =
-        serde_json::to_value(&expression).map_err(|error| Error::internal(format!("serialize AST: {error}")))?;
-    strip(&mut value);
-    serde_json::from_value(value).map_err(|error| Error::internal(format!("deserialize AST: {error}")))
 }

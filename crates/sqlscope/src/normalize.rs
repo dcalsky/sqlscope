@@ -27,6 +27,60 @@ pub(crate) fn normalize(sql: &str, dialect: Dialect) -> Cow<'_, str> {
     }
 }
 
+/// Input preparation for rewrites: [`normalize`] plus [`strip_comments`].
+pub(crate) fn prepare_rewrite(sql: &str, dialect: Dialect) -> Cow<'_, str> {
+    match normalize(sql, dialect) {
+        Cow::Borrowed(sql) => strip_comments(sql, dialect),
+        Cow::Owned(sql) => Cow::Owned(strip_comments(&sql, dialect).into_owned()),
+    }
+}
+
+/// Removes comments from `sql` using the dialect's tokenizer, so rewritten
+/// output regenerated from the AST carries none. Optimizer hints
+/// (`/*+ ... */`) are tokens, not comments, and are kept. Input the tokenizer
+/// rejects is returned unchanged for the parser to report.
+pub(crate) fn strip_comments(sql: &str, dialect: Dialect) -> Cow<'_, str> {
+    if sql.len() > crate::ast::MAX_INPUT_BYTES {
+        return Cow::Borrowed(sql); // rejected by the parser's input guard
+    }
+    let Ok(tokens) = polyglot_sql::Dialect::get(dialect.polyglot()).tokenize(sql) else {
+        return Cow::Borrowed(sql);
+    };
+    let commented = |token: &polyglot_sql::Token| !token.comments.is_empty() || !token.trailing_comments.is_empty();
+    if !tokens.iter().any(commented) {
+        return Cow::Borrowed(sql);
+    }
+    // Token spans are character offsets.
+    let mut bytes: Vec<usize> = sql.char_indices().map(|(at, _)| at).collect();
+    bytes.push(sql.len());
+    let byte = |chars: usize| bytes.get(chars).copied().unwrap_or(sql.len());
+
+    let mut out = String::with_capacity(sql.len());
+    let mut previous_end = 0;
+    let mut previous_commented = false;
+    for token in &tokens {
+        let (start, end) = (byte(token.span.start), byte(token.span.end));
+        if start < previous_end || end < start {
+            return Cow::Borrowed(sql); // unexpected spans: leave input alone
+        }
+        let gap = &sql[previous_end..start];
+        if previous_commented || !token.comments.is_empty() {
+            if !out.is_empty() {
+                out.push(if gap.contains('\n') { '\n' } else { ' ' });
+            }
+        } else {
+            out.push_str(gap);
+        }
+        out.push_str(&sql[start..end]);
+        previous_end = end;
+        previous_commented = !token.trailing_comments.is_empty();
+    }
+    if !previous_commented {
+        out.push_str(&sql[previous_end..]);
+    }
+    Cow::Owned(out)
+}
+
 /// Applies `transform` to the parts of `sql` outside string literals, quoted
 /// identifiers and comments.
 fn map_code_segments(sql: &str, transform: impl Fn(&str) -> String) -> String {
@@ -95,6 +149,17 @@ mod tests {
             normalize(sql, Dialect::STARROCKS),
             "select '[broadcast]', `[shuffle]` from a join  b -- [colocate]\n join  c"
         );
+    }
+
+    #[test]
+    fn strips_comments_but_not_hints_or_literals() {
+        let sql = "/* lead */ select /*+ SET_VAR(x=5) */ 'a -- b', $$c /* d */$$ -- tail\n from é /* e */ where x = 1";
+        assert_eq!(
+            strip_comments(sql, Dialect::POSTGRES),
+            "select /*+ SET_VAR(x=5) */ 'a -- b', $$c /* d */$$\nfrom é where x = 1"
+        );
+        let plain = "select 1";
+        assert!(matches!(strip_comments(plain, Dialect::TRINO), Cow::Borrowed(_)));
     }
 
     #[test]

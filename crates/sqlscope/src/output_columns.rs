@@ -112,12 +112,15 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
 
     // Inspect without the schema first: explicit names need none, and user
     // aliases such as `_col_0` must stay as written.
-    let mut output = native_output_columns(query, Some(dialect.polyglot())).map_err(failed)?;
+    let mut output =
+        ast::with_large_stack(|| native_output_columns(query, Some(dialect.polyglot()))).map_err(failed)?;
     let mut expanded = false;
     if !output.ordinal_complete {
         if let Some(validation) = schema::to_validation_schema(&options.schema) {
             let mapping = mapping_schema_from_validation_schema_with_dialect(&validation, dialect.polyglot());
-            output = output_columns_with_schema(query, Some(&mapping), Some(dialect.polyglot())).map_err(failed)?;
+            output =
+                ast::with_large_stack(|| output_columns_with_schema(query, Some(&mapping), Some(dialect.polyglot())))
+                    .map_err(failed)?;
             expanded = true;
         }
     }

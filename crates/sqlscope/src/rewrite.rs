@@ -133,63 +133,67 @@ struct Collector<'a> {
 
 impl<'a> Collector<'a> {
     fn visit(&mut self, node: &'a Expression, scope: &Scope) {
-        if is_query(node) {
-            self.visit_query(node, scope);
-            return;
-        }
-        if let Expression::Table(table) = node {
-            if !table.name.name.is_empty() {
-                // Only an unqualified name can denote a CTE.
-                let unqualified = table.schema.is_none() && table.catalog.is_none();
-                let cte_reference = unqualified && scope.ctes.contains(&table.name.name.to_lowercase());
-                self.sites.push(TableSite {
-                    node,
-                    table,
-                    cte_reference,
-                });
+        crate::ast::with_stack(|| {
+            if is_query(node) {
+                self.visit_query(node, scope);
                 return;
             }
-        }
-        for child in node.children() {
-            self.visit(child, scope);
-        }
+            if let Expression::Table(table) = node {
+                if !table.name.name.is_empty() {
+                    // Only an unqualified name can denote a CTE.
+                    let unqualified = table.schema.is_none() && table.catalog.is_none();
+                    let cte_reference = unqualified && scope.ctes.contains(&table.name.name.to_lowercase());
+                    self.sites.push(TableSite {
+                        node,
+                        table,
+                        cte_reference,
+                    });
+                    return;
+                }
+            }
+            for child in node.children() {
+                self.visit(child, scope);
+            }
+        })
     }
 
     fn visit_query(&mut self, query: &'a Expression, scope: &Scope) {
-        let mut cte_bodies: Vec<*const Expression> = Vec::new();
-        let inner = match query_with(query) {
-            Some(with) => {
-                let names: Vec<String> = with
-                    .ctes
-                    .iter()
-                    .map(|cte| cte.alias.name.to_lowercase())
-                    .filter(|name| !name.is_empty())
-                    .collect();
-                // A non-recursive CTE cannot see itself, so a same-named
-                // reference inside its body is the physical table. WITH
-                // RECURSIVE makes every sibling visible inside the bodies.
-                let body_scope = if with.recursive {
-                    scope.with(names.iter().cloned())
-                } else {
-                    scope.clone()
-                };
-                for cte in &with.ctes {
-                    cte_bodies.push(&cte.this);
-                    self.visit(&cte.this, &body_scope);
+        crate::ast::with_stack(|| {
+            let mut cte_bodies: Vec<*const Expression> = Vec::new();
+            let inner = match query_with(query) {
+                Some(with) => {
+                    let names: Vec<String> = with
+                        .ctes
+                        .iter()
+                        .map(|cte| cte.alias.name.to_lowercase())
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                    // A non-recursive CTE cannot see itself, so a same-named
+                    // reference inside its body is the physical table. WITH
+                    // RECURSIVE makes every sibling visible inside the bodies.
+                    let body_scope = if with.recursive {
+                        scope.with(names.iter().cloned())
+                    } else {
+                        scope.clone()
+                    };
+                    for cte in &with.ctes {
+                        cte_bodies.push(&cte.this);
+                        self.visit(&cte.this, &body_scope);
+                    }
+                    scope.with(names)
                 }
-                scope.with(names)
-            }
-            None => scope.clone(),
-        };
+                None => scope.clone(),
+            };
 
-        if let Expression::Select(select) = query {
-            self.record_occupancy(select, &inner);
-        }
-        for child in query.children() {
-            if !cte_bodies.contains(&(child as *const Expression)) {
-                self.visit(child, &inner);
+            if let Expression::Select(select) = query {
+                self.record_occupancy(select, &inner);
             }
-        }
+            for child in query.children() {
+                if !cte_bodies.contains(&(child as *const Expression)) {
+                    self.visit(child, &inner);
+                }
+            }
+        })
     }
 
     fn record_occupancy(&mut self, select: &'a Select, scope: &Scope) {
@@ -412,141 +416,148 @@ impl<'r, 'a, R: Replacement> Rebinder<'r, 'a, R> {
     /// Rebinds within a query node, inheriting `qualified` from the enclosing
     /// query.
     fn query(&mut self, query: &'a Expression, qualified: &Bindings) -> Result<()> {
-        let Expression::Select(select) = query else {
-            // Set operations have no FROM scope of their own.
-            for child in query.children() {
-                self.descend(child, qualified)?;
-            }
-            return Ok(());
-        };
+        crate::ast::with_stack(|| {
+            let Expression::Select(select) = query else {
+                // Set operations have no FROM scope of their own.
+                for child in query.children() {
+                    self.descend(child, qualified)?;
+                }
+                return Ok(());
+            };
 
-        let entries = from_entries(select);
-        let own: Vec<&Match<'a, R>> = self
-            .matches
-            .iter()
-            .filter(|matched| matched.identity.is_some())
-            .filter(|matched| entries.iter().any(|entry| std::ptr::eq(*entry, matched.node)))
-            .collect();
-
-        let mut scope = SelectScope {
-            qualified: qualified.clone(),
-            bare: Bindings::new(),
-            // Names as bound after the rewrite: a replaced entry binds its
-            // derived-table alias.
-            relations: entries
+            let entries = from_entries(select);
+            let own: Vec<&Match<'a, R>> = self
+                .matches
                 .iter()
-                .filter_map(
-                    |entry| match self.matches.iter().find(|m| std::ptr::eq(m.node, *entry)) {
-                        Some(matched) => Some(matched.alias.name.to_lowercase()),
-                        None => relation_name(entry),
-                    },
-                )
-                .collect(),
-        };
+                .filter(|matched| matched.identity.is_some())
+                .filter(|matched| entries.iter().any(|entry| std::ptr::eq(*entry, matched.node)))
+                .collect();
 
-        let mut qualifier_counts: HashMap<String, usize> = HashMap::new();
-        let mut name_counts: HashMap<&str, usize> = HashMap::new();
-        for matched in &own {
-            for key in matched.claimed_qualifiers() {
-                *qualifier_counts.entry(key).or_default() += 1;
+            let mut scope = SelectScope {
+                qualified: qualified.clone(),
+                bare: Bindings::new(),
+                // Names as bound after the rewrite: a replaced entry binds its
+                // derived-table alias.
+                relations: entries
+                    .iter()
+                    .filter_map(
+                        |entry| match self.matches.iter().find(|m| std::ptr::eq(m.node, *entry)) {
+                            Some(matched) => Some(matched.alias.name.to_lowercase()),
+                            None => relation_name(entry),
+                        },
+                    )
+                    .collect(),
+            };
+
+            let mut qualifier_counts: HashMap<String, usize> = HashMap::new();
+            let mut name_counts: HashMap<&str, usize> = HashMap::new();
+            for matched in &own {
+                for key in matched.claimed_qualifiers() {
+                    *qualifier_counts.entry(key).or_default() += 1;
+                }
+                *name_counts.entry(matched.name_lower.as_str()).or_default() += 1;
             }
-            *name_counts.entry(matched.name_lower.as_str()).or_default() += 1;
-        }
-        for matched in &own {
-            for key in matched.claimed_qualifiers() {
-                if qualifier_counts[&key] == 1 {
-                    scope.qualified.insert(key, matched.alias.clone());
-                } else {
-                    // Ambiguous in this scope: callers must use the alias.
-                    scope.qualified.remove(&key);
+            for matched in &own {
+                for key in matched.claimed_qualifiers() {
+                    if qualifier_counts[&key] == 1 {
+                        scope.qualified.insert(key, matched.alias.clone());
+                    } else {
+                        // Ambiguous in this scope: callers must use the alias.
+                        scope.qualified.remove(&key);
+                    }
+                }
+                // A bare `table.col` already resolves when the alias keeps the
+                // bare name; several same-named tables make it ambiguous.
+                if name_counts[matched.name_lower.as_str()] == 1
+                    && matched.alias.name.to_lowercase() != matched.name_lower
+                {
+                    scope.bare.insert(matched.name_lower.clone(), matched.alias.clone());
                 }
             }
-            // A bare `table.col` already resolves when the alias keeps the
-            // bare name; several same-named tables make it ambiguous.
-            if name_counts[matched.name_lower.as_str()] == 1 && matched.alias.name.to_lowercase() != matched.name_lower
-            {
-                scope.bare.insert(matched.name_lower.clone(), matched.alias.clone());
-            }
-        }
 
-        let cte_bodies: Vec<*const Expression> = select
-            .with
-            .iter()
-            .flat_map(|with| with.ctes.iter().map(|cte| &cte.this as *const Expression))
-            .collect();
-        for child in query.children() {
-            if cte_bodies.contains(&(child as *const Expression)) {
-                // CTE bodies are their own scopes; they only inherit qualified
-                // bindings.
-                self.descend(child, &scope.qualified)?;
-            } else {
-                self.clause(child, &scope)?;
+            let cte_bodies: Vec<*const Expression> = select
+                .with
+                .iter()
+                .flat_map(|with| with.ctes.iter().map(|cte| &cte.this as *const Expression))
+                .collect();
+            for child in query.children() {
+                if cte_bodies.contains(&(child as *const Expression)) {
+                    // CTE bodies are their own scopes; they only inherit qualified
+                    // bindings.
+                    self.descend(child, &scope.qualified)?;
+                } else {
+                    self.clause(child, &scope)?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Walks a node outside any SELECT clause, looking for nested queries.
     fn descend(&mut self, node: &'a Expression, qualified: &Bindings) -> Result<()> {
-        if is_query(node) {
-            return self.query(node, qualified);
-        }
-        if let Expression::Subquery(subquery) = node {
-            if is_query(&subquery.this) {
-                return self.query(&subquery.this, qualified);
+        crate::ast::with_stack(|| {
+            if is_query(node) {
+                return self.query(node, qualified);
             }
-        }
-        for child in node.children() {
-            self.descend(child, qualified)?;
-        }
-        Ok(())
+            if let Expression::Subquery(subquery) = node {
+                if is_query(&subquery.this) {
+                    return self.query(&subquery.this, qualified);
+                }
+            }
+            for child in node.children() {
+                self.descend(child, qualified)?;
+            }
+            Ok(())
+        })
     }
 
     /// Walks a node inside a SELECT clause, rebinding references.
     fn clause(&mut self, node: &'a Expression, scope: &SelectScope) -> Result<()> {
-        if is_query(node) {
-            return self.query(node, &scope.qualified);
-        }
-        match node {
-            Expression::Subquery(subquery) if is_query(&subquery.this) => {
-                return self.query(&subquery.this, &scope.qualified);
+        crate::ast::with_stack(|| {
+            if is_query(node) {
+                return self.query(node, &scope.qualified);
             }
-            Expression::Star(star) => {
-                if let Some(alias) = star_qualifier(star).and_then(|parts| lookup(&parts, scope)) {
-                    let mut rebound = star.clone();
-                    rebound.table = Some(alias.ident());
-                    return self
-                        .edits
-                        .replace(self.ids, node, move |_| Ok(Expression::Star(rebound)));
+            match node {
+                Expression::Subquery(subquery) if is_query(&subquery.this) => {
+                    return self.query(&subquery.this, &scope.qualified);
                 }
-            }
-            Expression::Column(_) | Expression::Dot(_) => {
-                if let Some(chain) = reference_chain(node) {
-                    if chain.len() >= 2 {
-                        let qualifier: Vec<String> =
-                            chain[..chain.len() - 1].iter().map(|part| ident_key(part)).collect();
-                        if let Some(alias) = lookup(&qualifier, scope) {
-                            let field = chain[chain.len() - 1].clone();
-                            return self.edits.replace(self.ids, node, move |_| {
-                                Ok(Expression::Column(Box::new(Column {
-                                    name: field,
-                                    table: Some(alias.ident()),
-                                    join_mark: false,
-                                    trailing_comments: Vec::new(),
-                                    span: None,
-                                    inferred_type: None,
-                                })))
-                            });
+                Expression::Star(star) => {
+                    if let Some(alias) = star_qualifier(star).and_then(|parts| lookup(&parts, scope)) {
+                        let mut rebound = star.clone();
+                        rebound.table = Some(alias.ident());
+                        return self
+                            .edits
+                            .replace(self.ids, node, move |_| Ok(Expression::Star(rebound)));
+                    }
+                }
+                Expression::Column(_) | Expression::Dot(_) => {
+                    if let Some(chain) = reference_chain(node) {
+                        if chain.len() >= 2 {
+                            let qualifier: Vec<String> =
+                                chain[..chain.len() - 1].iter().map(|part| ident_key(part)).collect();
+                            if let Some(alias) = lookup(&qualifier, scope) {
+                                let field = chain[chain.len() - 1].clone();
+                                return self.edits.replace(self.ids, node, move |_| {
+                                    Ok(Expression::Column(Box::new(Column {
+                                        name: field,
+                                        table: Some(alias.ident()),
+                                        join_mark: false,
+                                        trailing_comments: Vec::new(),
+                                        span: None,
+                                        inferred_type: None,
+                                    })))
+                                });
+                            }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-        for child in node.children() {
-            self.clause(child, scope)?;
-        }
-        Ok(())
+            for child in node.children() {
+                self.clause(child, scope)?;
+            }
+            Ok(())
+        })
     }
 }
 

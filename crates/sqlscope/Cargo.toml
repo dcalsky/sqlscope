@@ -15,9 +15,9 @@ readme = "../../README.md"
 [features]
 default = ["stacker"]
 # Grow the native stack on deep parser recursion. Disable for wasm targets.
-stacker = ["polyglot-sql/stacker"]
+stacker = ["polyglot-sql/stacker", "dep:stacker"]
 
 [dependencies]
-polyglot-sql = { workspace = true, features = ["all-dialects", "generate", "ast-tools", "semantic", "openlineage"] }
+polyglot-sql = { workspace = true, features = ["all-dialects", "generate", "ast-tools", "semantic"] }
 regex.workspace = true
-serde_json.workspace = true
+stacker = { version = "0.1", optional = true }

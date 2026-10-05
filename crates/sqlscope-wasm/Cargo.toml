@@ -1,0 +1,17 @@
+[package]
+name = "sqlscope-wasm"
+description = "WebAssembly (WASI) module exposing sqlscope through a JSON ABI; used by the Go SDK"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sqlscope = { path = "../sqlscope", default-features = false }
+serde.workspace = true
+serde_json.workspace = true

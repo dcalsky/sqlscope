@@ -5,7 +5,7 @@ use polyglot_sql::Expression;
 
 use crate::ast::{self, ident, opt_name};
 use crate::error::{Error, Result};
-use crate::normalize::normalize;
+use crate::normalize::prepare_rewrite;
 use crate::options::Options;
 use crate::rewrite::{column, derived_table, rewrite_statement, select_from, star, AliasRef, Replacement};
 
@@ -154,7 +154,7 @@ pub fn rewrite_tables(sql: &str, rewrites: &[TableRewrite], options: &Options) -
         .filter(|catalog| !catalog.is_empty())
         .collect();
 
-    let normalized = normalize(sql, dialect);
+    let normalized = prepare_rewrite(sql, dialect);
     let statement = ast::parse_query(&normalized, dialect)?;
     let rewritten = rewrite_statement(statement, |table| {
         let key = match_key(table, &transparent)?;
@@ -162,7 +162,7 @@ pub fn rewrite_tables(sql: &str, rewrites: &[TableRewrite], options: &Options) -
     })?;
     match rewritten {
         None => Ok(sql.to_owned()),
-        Some(rewritten) => ast::generate_checked(&ast::strip_comments(rewritten)?, dialect),
+        Some(rewritten) => ast::generate_checked(&rewritten, dialect),
     }
 }
 

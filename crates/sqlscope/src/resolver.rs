@@ -368,7 +368,7 @@ impl<'a, 's> Resolver<'a, 's> {
 
     /// Resolves a SELECT or set operation and returns its output mapping.
     fn resolve_query(&mut self, query: &'a Expression, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
-        match query {
+        crate::ast::with_stack(|| match query {
             Expression::Select(select) => self.resolve_select(select, parent),
             Expression::Union(op) => self.resolve_set_op(
                 &op.left,
@@ -398,79 +398,81 @@ impl<'a, 's> Resolver<'a, 's> {
                 Some(inner) => self.resolve_query(inner, parent),
                 None => Rc::default(),
             },
-        }
+        })
     }
 
     fn resolve_select(&mut self, select: &'a Select, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
-        let scope = self.new_scope(select.with.as_ref(), parent);
-        for entry in select.from.iter().flat_map(|from| from.expressions.iter()) {
-            self.add_source(entry, &scope);
-        }
-        for join in &select.joins {
-            self.add_source(&join.this, &scope);
-        }
-        if !self.flow_only {
-            self.collect_deferred(&scope);
-        }
+        crate::ast::with_stack(|| {
+            let scope = self.new_scope(select.with.as_ref(), parent);
+            for entry in select.from.iter().flat_map(|from| from.expressions.iter()) {
+                self.add_source(entry, &scope);
+            }
+            for join in &select.joins {
+                self.add_source(&join.this, &scope);
+            }
+            if !self.flow_only {
+                self.collect_deferred(&scope);
+            }
 
-        let out = Rc::new(self.build_output(&select.expressions, &scope));
-        // Filter, grouping and ordering positions do not flow into the result.
-        if self.flow_only {
-            return out;
-        }
+            let out = Rc::new(self.build_output(&select.expressions, &scope));
+            // Filter, grouping and ordering positions do not flow into the result.
+            if self.flow_only {
+                return out;
+            }
 
-        if let Some(clause) = &select.where_clause {
-            self.collect(&clause.this, &scope, Clause::Where, None);
-        }
-        if let Some(group_by) = &select.group_by {
-            self.collect_items(group_by.expressions.iter(), &scope, Clause::GroupBy, &out);
-        }
-        if let Some(having) = &select.having {
-            self.collect(&having.this, &scope, Clause::Having, Some(&out));
-        }
-        if let Some(qualify) = &select.qualify {
-            self.collect(&qualify.this, &scope, Clause::Qualify, Some(&out));
-        }
-        for window in select.windows.iter().flatten() {
-            for expression in &window.spec.partition_by {
-                self.collect(expression, &scope, Clause::Window, None);
+            if let Some(clause) = &select.where_clause {
+                self.collect(&clause.this, &scope, Clause::Where, None);
             }
-            for ordered in &window.spec.order_by {
-                self.collect(&ordered.this, &scope, Clause::Window, None);
+            if let Some(group_by) = &select.group_by {
+                self.collect_items(group_by.expressions.iter(), &scope, Clause::GroupBy, &out);
             }
-        }
-        if let Some(order_by) = &select.order_by {
-            self.collect_items(ordered_items(&order_by.expressions), &scope, Clause::OrderBy, &out);
-        }
-        if let Some(sort_by) = &select.sort_by {
-            self.collect_items(ordered_items(&sort_by.expressions), &scope, Clause::SortBy, &out);
-        }
-        if let Some(distribute_by) = &select.distribute_by {
-            self.collect_items(distribute_by.expressions.iter(), &scope, Clause::DistributeBy, &out);
-        }
-        if let Some(cluster_by) = &select.cluster_by {
-            self.collect_items(ordered_items(&cluster_by.expressions), &scope, Clause::ClusterBy, &out);
-        }
-        if let Some(connect) = &select.connect {
-            if let Some(start) = &connect.start {
-                self.collect(start, &scope, Clause::ConnectBy, None);
+            if let Some(having) = &select.having {
+                self.collect(&having.this, &scope, Clause::Having, Some(&out));
             }
-            self.collect(&connect.connect, &scope, Clause::ConnectBy, None);
-        }
-        for view in &select.lateral_views {
-            self.collect(&view.this, &scope, Clause::LateralView, None);
-        }
-        for join in &select.joins {
-            if let Some(on) = &join.on {
-                self.collect(on, &scope, Clause::JoinOn, None);
+            if let Some(qualify) = &select.qualify {
+                self.collect(&qualify.this, &scope, Clause::Qualify, Some(&out));
             }
-            // USING (k) names a column shared by both sides.
-            for column in &join.using {
-                let refs = self.resolve_unqualified(&column.name, &scope);
-                self.add_refs(&refs, Clause::JoinUsing);
+            for window in select.windows.iter().flatten() {
+                for expression in &window.spec.partition_by {
+                    self.collect(expression, &scope, Clause::Window, None);
+                }
+                for ordered in &window.spec.order_by {
+                    self.collect(&ordered.this, &scope, Clause::Window, None);
+                }
             }
-        }
-        out
+            if let Some(order_by) = &select.order_by {
+                self.collect_items(ordered_items(&order_by.expressions), &scope, Clause::OrderBy, &out);
+            }
+            if let Some(sort_by) = &select.sort_by {
+                self.collect_items(ordered_items(&sort_by.expressions), &scope, Clause::SortBy, &out);
+            }
+            if let Some(distribute_by) = &select.distribute_by {
+                self.collect_items(distribute_by.expressions.iter(), &scope, Clause::DistributeBy, &out);
+            }
+            if let Some(cluster_by) = &select.cluster_by {
+                self.collect_items(ordered_items(&cluster_by.expressions), &scope, Clause::ClusterBy, &out);
+            }
+            if let Some(connect) = &select.connect {
+                if let Some(start) = &connect.start {
+                    self.collect(start, &scope, Clause::ConnectBy, None);
+                }
+                self.collect(&connect.connect, &scope, Clause::ConnectBy, None);
+            }
+            for view in &select.lateral_views {
+                self.collect(&view.this, &scope, Clause::LateralView, None);
+            }
+            for join in &select.joins {
+                if let Some(on) = &join.on {
+                    self.collect(on, &scope, Clause::JoinOn, None);
+                }
+                // USING (k) names a column shared by both sides.
+                for column in &join.using {
+                    let refs = self.resolve_unqualified(&column.name, &scope);
+                    self.add_refs(&refs, Clause::JoinUsing);
+                }
+            }
+            out
+        })
     }
 
     /// Merges set-operation branches positionally (names from the left).
@@ -700,23 +702,25 @@ impl<'a, 's> Resolver<'a, 's> {
     /// unqualified names that match a projection alias resolve to the
     /// projection's source columns (GROUP BY, HAVING, QUALIFY, ORDER BY ...).
     fn collect(&mut self, expression: &'a Expression, scope: &Rc<Scope<'a>>, clause: Clause, output: Option<&Output>) {
-        if is_query(expression) {
-            self.resolve_query(expression, Some(scope));
-            return;
-        }
-        match expression {
-            Expression::Column(column) => {
-                self.record_column(column, scope, clause, output);
+        crate::ast::with_stack(|| {
+            if is_query(expression) {
+                self.resolve_query(expression, Some(scope));
+                return;
             }
-            Expression::Dot(_) => {
-                self.record_dot(expression, scope, clause);
-            }
-            _ => {
-                for child in expression.children() {
-                    self.collect(child, scope, clause, output);
+            match expression {
+                Expression::Column(column) => {
+                    self.record_column(column, scope, clause, output);
+                }
+                Expression::Dot(_) => {
+                    self.record_dot(expression, scope, clause);
+                }
+                _ => {
+                    for child in expression.children() {
+                        self.collect(child, scope, clause, output);
+                    }
                 }
             }
-        }
+        })
     }
 
     /// Like [`collect`](Self::collect) for a clause whose items may be
@@ -743,21 +747,23 @@ impl<'a, 's> Resolver<'a, 's> {
     /// Records the references in `expression` and returns them; a nested
     /// query contributes its output values.
     fn collect_refs(&mut self, expression: &'a Expression, scope: &Rc<Scope<'a>>, clause: Clause) -> Vec<ColRef> {
-        if is_query(expression) {
-            let out = self.resolve_query(expression, Some(scope));
-            return out.positions.iter().flatten().cloned().collect();
-        }
-        match expression {
-            Expression::Column(column) => self.record_column(column, scope, clause, None),
-            Expression::Dot(_) => self.record_dot(expression, scope, clause),
-            _ => {
-                let mut refs = Vec::new();
-                for child in expression.children() {
-                    refs.extend(self.collect_refs(child, scope, clause));
-                }
-                refs
+        crate::ast::with_stack(|| {
+            if is_query(expression) {
+                let out = self.resolve_query(expression, Some(scope));
+                return out.positions.iter().flatten().cloned().collect();
             }
-        }
+            match expression {
+                Expression::Column(column) => self.record_column(column, scope, clause, None),
+                Expression::Dot(_) => self.record_dot(expression, scope, clause),
+                _ => {
+                    let mut refs = Vec::new();
+                    for child in expression.children() {
+                        refs.extend(self.collect_refs(child, scope, clause));
+                    }
+                    refs
+                }
+            }
+        })
     }
 
     fn record_column(

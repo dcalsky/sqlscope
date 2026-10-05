@@ -52,7 +52,8 @@ pub struct Error {
 }
 
 impl Error {
-    pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+    /// Creates an error; useful for bindings that validate their own input.
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
