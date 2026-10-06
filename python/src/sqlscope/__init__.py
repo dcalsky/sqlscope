@@ -14,24 +14,34 @@ column_usages          Column references with the clause they appear in.
 
 Every function accepts ``dialect`` (default ``"trino"``). Functions release the
 GIL while they run and are safe to call from several threads.
+
+The SQL engine is the sqlscope FFI shared library (``libsqlscope_ffi.so``,
+``libsqlscope_ffi.dylib`` or ``sqlscope_ffi.dll``) published with each sqlscope
+release. It is loaded on first use; see :func:`load` for how it is located.
+This package neither bundles nor downloads it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from . import _native
-from ._native import (
+from ._library import (
+    LIBRARY_PATH_ENV,
     Error,
     InternalError,
     InvalidArgumentError,
+    LibraryNotFoundError,
     ParseError,
     UnsupportedError,
+    call,
+    library_file_name,
+    library_version,
+    load,
 )
 
-__version__: str = _native.__version__
+__version__ = "0.2.0"
 
 __all__ = [
     "Clause",
@@ -40,6 +50,8 @@ __all__ = [
     "Error",
     "InternalError",
     "InvalidArgumentError",
+    "LIBRARY_PATH_ENV",
+    "LibraryNotFoundError",
     "ParseError",
     "Schema",
     "TableRef",
@@ -50,6 +62,9 @@ __all__ = [
     "column_origins",
     "column_usages",
     "inject_ctes",
+    "library_file_name",
+    "library_version",
+    "load",
     "output_columns",
     "referenced_columns",
     "rewrite_tables",
@@ -150,6 +165,15 @@ def _list(values: Optional[Iterable[str]]) -> Optional[List[str]]:
     return list(values)
 
 
+def _run(operation: str, sql: str, *, dialect: Optional[str], **fields: Any) -> Any:
+    """Calls ``operation``; ``fields`` holds request fields and options, ``None`` meaning unset."""
+    options = {"dialect": dialect}
+    for name in ("schema", "tableNames", "tablePatterns", "defaultDb", "stripCatalogs"):
+        options[name] = fields.pop(name, None)
+    request = {"sql": sql, **fields, "options": {k: v for k, v in options.items() if v is not None}}
+    return call(operation, request)
+
+
 def apply_row_filter(
     sql: str,
     predicate: str,
@@ -169,14 +193,16 @@ def apply_row_filter(
     boolean expression; bind or escape its values before calling. Returns the
     input unchanged when no table is in scope.
     """
-    return _native.apply_row_filter(
+    result: str = _run(
+        "apply_row_filter",
         sql,
-        predicate,
+        predicate=predicate,
         dialect=dialect,
-        table_names=_list(table_names),
-        table_patterns=_list(table_patterns),
-        default_db=default_db,
+        tableNames=_list(table_names),
+        tablePatterns=_list(table_patterns),
+        defaultDb=default_db,
     )
+    return result
 
 
 def inject_ctes(
@@ -190,12 +216,16 @@ def inject_ctes(
     Definitions keep their order, so each may use earlier ones. A name that
     repeats another definition or an existing root CTE is rejected.
     """
-    pairs = [(cte.name, cte.query) if isinstance(cte, CteDef) else (cte[0], cte[1]) for cte in ctes]
-    return _native.inject_ctes(sql, pairs, dialect=dialect)
+    defs = [
+        {"name": cte.name, "query": cte.query} if isinstance(cte, CteDef) else {"name": cte[0], "query": cte[1]}
+        for cte in ctes
+    ]
+    result: str = _run("inject_ctes", sql, ctes=defs, dialect=dialect)
+    return result
 
 
-def _table(ref: TableRef) -> Tuple[str, Optional[str], Optional[str]]:
-    return (ref.table, ref.schema, ref.catalog)
+def _table(ref: TableRef) -> Dict[str, Optional[str]]:
+    return {"table": ref.table, "schema": ref.schema, "catalog": ref.catalog}
 
 
 def rewrite_tables(
@@ -213,20 +243,21 @@ def rewrite_tables(
     unchanged when nothing matches.
     """
     plan = [
-        (
-            rewrite.match_key,
-            _table(rewrite.inline) if rewrite.inline is not None else None,
-            (
-                rewrite.union.table_alias,
-                list(rewrite.union.columns),
-                [_table(branch) for branch in rewrite.union.branches],
-            )
+        {
+            "matchKey": rewrite.match_key,
+            "inline": _table(rewrite.inline) if rewrite.inline is not None else None,
+            "union": {
+                "tableAlias": rewrite.union.table_alias,
+                "columns": list(rewrite.union.columns),
+                "branches": [_table(branch) for branch in rewrite.union.branches],
+            }
             if rewrite.union is not None
             else None,
-        )
+        }
         for rewrite in rewrites
     ]
-    return _native.rewrite_tables(sql, plan, dialect=dialect, strip_catalogs=_list(strip_catalogs))
+    result: str = _run("rewrite_tables", sql, rewrites=plan, dialect=dialect, stripCatalogs=_list(strip_catalogs))
+    return result
 
 
 def column_origins(
@@ -238,7 +269,8 @@ def column_origins(
     right side of INTERSECT / EXCEPT are excluded. Every table read is present,
     possibly with an empty list.
     """
-    return _native.column_origins(sql, dialect=dialect, schema=_schema(schema))
+    result: Dict[str, List[str]] = _run("column_origins", sql, dialect=dialect, schema=_schema(schema))
+    return result
 
 
 def output_columns(
@@ -249,14 +281,16 @@ def output_columns(
     Unaliased expressions are named ``_col{i}``; ``*`` expands from ``schema``
     or stays ``"*"``. Returns ``None`` for statements without columns.
     """
-    return _native.output_columns(sql, dialect=dialect, schema=_schema(schema))
+    result: Optional[List[str]] = _run("output_columns", sql, dialect=dialect, schema=_schema(schema))
+    return result
 
 
 def referenced_columns(
     sql: str, *, dialect: Optional[str] = None, schema: Optional[Schema] = None
 ) -> Dict[str, List[str]]:
     """Columns referenced anywhere in a statement (including filters), keyed by root table."""
-    return _native.referenced_columns(sql, dialect=dialect, schema=_schema(schema))
+    result: Dict[str, List[str]] = _run("referenced_columns", sql, dialect=dialect, schema=_schema(schema))
+    return result
 
 
 def column_usages(
@@ -264,6 +298,6 @@ def column_usages(
 ) -> List[ColumnUsage]:
     """Every distinct ``(table, column, clause)`` use in a statement, sorted."""
     return [
-        ColumnUsage(table, column, Clause(clause))
-        for table, column, clause in _native.column_usages(sql, dialect=dialect, schema=_schema(schema))
+        ColumnUsage(usage["table"], usage["column"], Clause(usage["clause"]))
+        for usage in _run("column_usages", sql, dialect=dialect, schema=_schema(schema))
     ]

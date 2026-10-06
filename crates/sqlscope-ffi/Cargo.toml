@@ -1,6 +1,6 @@
 [package]
-name = "sqlscope-wasm"
-description = "WebAssembly (WASI) module exposing sqlscope through a JSON ABI; used by the Go SDK"
+name = "sqlscope-ffi"
+description = "C ABI for sqlscope (shared and static libraries); used by the Python and Go SDKs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,9 +9,10 @@ repository.workspace = true
 publish = false
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+name = "sqlscope_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-sqlscope = { path = "../sqlscope", default-features = false }
+sqlscope = { path = "../sqlscope" }
 serde.workspace = true
 serde_json.workspace = true

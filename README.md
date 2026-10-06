@@ -19,11 +19,29 @@ operations, derived tables, `USING`, `PIVOT`, `UNNEST`, lateral views.
 
 ## Install
 
+Each [release](https://github.com/dcalsky/sqlscope/releases) ships the
+sqlscope FFI library for Linux (x86_64, aarch64; glibc ≥ 2.35), macOS
+(x86_64, aarch64) and Windows (x86_64) as `sqlscope-ffi-<platform>.tar.gz`
+/ `.zip`: a shared library (`libsqlscope_ffi.so`, `libsqlscope_ffi.dylib`,
+`sqlscope_ffi.dll`), a static library (`libsqlscope_ffi.a`,
+`sqlscope_ffi.lib`) and the C header `sqlscope.h`.
+
+The Python and Go SDKs are thin wrappers that load that shared library at
+runtime. They never bundle or download it: install the library yourself and
+point the SDK at it with `SQLSCOPE_LIBRARY_PATH`, or with `sqlscope.load(path)`
+(Python) / `sqlscope.Load(path)` (Go). Without either, the SDKs look for the
+library in the Python package directory (Python) or next to the executable
+(Go), then on the system library search path.
+
 | Language | Package |
 | --- | --- |
 | Rust | `cargo add sqlscope` |
-| Python | `pip install sqlscope-rs` (imported as `sqlscope`; wheels for Linux, macOS, Windows; Python ≥ 3.9) |
-| Go | `go get github.com/dcalsky/sqlscope/go` (pure Go, no cgo) |
+| C / C++ / others | link `sqlscope-ffi` from a release; see `sqlscope.h` |
+| Python | `pip install sqlscope-rs` (imported as `sqlscope`; pure Python, ≥ 3.9) |
+| Go | `go get github.com/dcalsky/sqlscope/go` (no cgo; uses [purego](https://github.com/ebitengine/purego)) |
+
+Use the SDK and library from the same release; they check the ABI version
+when loading.
 
 ## Usage
 
@@ -75,9 +93,21 @@ cols, err := sqlscope.ColumnOrigins(sql,
     sqlscope.WithSchema(map[string][]string{"orders": {"id", "tenant_id"}}))
 ```
 
-The Go SDK runs the Rust engine compiled to WebAssembly with
-[wazero](https://wazero.io). The engine is compiled once per process on first
-use (about a second); call `sqlscope.Init()` at startup to do it eagerly.
+### C
+
+```c
+#include "sqlscope.h"
+
+char *response = sqlscope_call("apply_row_filter",
+    "{\"sql\": \"SELECT id FROM orders\", \"predicate\": \"tenant_id = 7\"}");
+/* {"ok":"SELECT id FROM (SELECT * FROM orders WHERE tenant_id = 7) AS orders"} */
+sqlscope_free(response);
+```
+
+Every operation takes a JSON request and returns `{"ok": ...}` or
+`{"error": {"kind": ..., "message": ...}}`; `sqlscope.h` documents the
+request fields. Linking the static library also needs a few system libraries,
+listed in the README inside each release archive.
 
 ## Options
 
@@ -167,22 +197,22 @@ returning it; when nothing needs rewriting, the input is returned unchanged.
 ## Development
 
 ```bash
-cargo test --workspace --exclude sqlscope-python     # Rust
-cd python && uv venv && uv pip install maturin pytest \
-  && .venv/bin/maturin develop && .venv/bin/pytest    # Python
-scripts/build-wasm.sh && (cd go && go test ./...)     # Go
+cargo test --workspace                                # Rust
+cargo build -p sqlscope-ffi                           # FFI library for the SDKs
+export SQLSCOPE_LIBRARY_PATH="$PWD/target/debug/libsqlscope_ffi.dylib"  # .so on Linux
+(cd go && go test ./...)                              # Go
+(cd python && python -m pytest)                       # Python (needs pytest)
 ```
 
-`scripts/build-wasm.sh` needs the `wasm32-wasip1` Rust target and regenerates
-`go/internal/wasm/sqlscope.wasm.gz`, which is committed so `go get` works. CI
-rebuilds it on every run, tests the Go SDK against the fresh build, and on
-`main` commits it back when it changed.
+`cargo build -p sqlscope-ffi --profile ffi` produces the optimized libraries
+that releases ship.
 
-To release, bump `version` in the root `Cargo.toml`, wait for CI on `main`
-to finish (it may commit an updated engine), then tag that commit:
+To release, bump `version` in the root `Cargo.toml` and `__version__` in
+`python/src/sqlscope/__init__.py`, then tag:
 `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow runs CI,
-publishes the wheels to PyPI, tags the Go module as `go/vX.Y.Z` and attaches
-the wheels, sdist and WebAssembly engine to a GitHub release.
+builds and tests the FFI library on every platform, attaches the archives
+and checksums to a GitHub release, publishes the pure-Python package to PyPI
+and tags the Go module as `go/vX.Y.Z`.
 
 ## License
 

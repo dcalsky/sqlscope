@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/sqlscope", "crates/sqlscope-wasm", "python"]
-default-members = ["crates/sqlscope", "crates/sqlscope-wasm", "python"]
+members = ["crates/sqlscope", "crates/sqlscope-ffi"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -22,9 +21,9 @@ regex = "1"
 lto = true
 codegen-units = 1
 
-# Size-optimized build of the WebAssembly module embedded in the Go SDK.
-[profile.wasm]
+# Release build of the FFI libraries. Panics must unwind so the C ABI can
+# turn them into errors instead of aborting the host process.
+[profile.ffi]
 inherits = "release"
-opt-level = "s"
-strip = true
-panic = "abort"
+panic = "unwind"
+strip = "debuginfo"

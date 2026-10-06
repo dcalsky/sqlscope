@@ -1,15 +1,18 @@
-//! A JSON ABI over sqlscope for WebAssembly hosts.
+//! The C ABI of sqlscope, built as a shared and a static library.
 //!
-//! The host allocates input buffers with [`sqlscope_alloc`], calls
-//! [`sqlscope_call`] with an operation name and a JSON request, reads the
-//! JSON response located by the returned `(pointer << 32) | length`, and
-//! releases every buffer with [`sqlscope_free`].
+//! Every operation goes through one function: [`sqlscope_call`] takes an
+//! operation name and a JSON request, both NUL-terminated UTF-8, and returns
+//! a NUL-terminated JSON response that the caller releases with
+//! [`sqlscope_free`]. The declarations live in `include/sqlscope.h`.
 //!
 //! A response is either `{"ok": <result>}` or
 //! `{"error": {"kind": "<kind>", "message": "<message>"}}` where kind is one
-//! of `invalid_argument`, `parse`, `unsupported` or `internal`.
+//! of `invalid_argument`, `parse`, `unsupported` or `internal`. Every
+//! function is safe to call concurrently from any thread.
 
 use std::collections::BTreeMap;
+use std::ffi::{c_char, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -117,8 +120,7 @@ fn invalid(message: String) -> Value {
     json!({"error": {"kind": "invalid_argument", "message": message}})
 }
 
-/// Executes one request and returns the JSON response. Exposed for tests and
-/// non-wasm hosts.
+/// Executes one request and returns the JSON response.
 pub fn execute(operation: &str, request: &[u8]) -> Value {
     let request: Request = match serde_json::from_slice(request) {
         Ok(request) => request,
@@ -209,54 +211,71 @@ fn invalid_error(message: String) -> Error {
 }
 
 // ---------------------------------------------------------------------------
-// WebAssembly exports
+// C exports
 // ---------------------------------------------------------------------------
 
-/// The ABI version implemented by this module.
+/// The ABI version implemented by this library.
 #[no_mangle]
 pub extern "C" fn sqlscope_abi_version() -> u32 {
     ABI_VERSION
 }
 
-/// Allocates `len` bytes in module memory for the host to fill.
+/// The library version as a static NUL-terminated string; do not free it.
 #[no_mangle]
-pub extern "C" fn sqlscope_alloc(len: u32) -> *mut u8 {
-    let mut buffer = Vec::<u8>::with_capacity(len as usize);
-    let pointer = buffer.as_mut_ptr();
-    std::mem::forget(buffer);
-    pointer
+pub extern "C" fn sqlscope_version() -> *const c_char {
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
 }
 
-/// Releases a buffer returned by [`sqlscope_alloc`] or [`sqlscope_call`].
+/// Reads a NUL-terminated UTF-8 argument.
 ///
 /// # Safety
-/// `pointer` and `len` must describe a live buffer from this module.
-#[no_mangle]
-pub unsafe extern "C" fn sqlscope_free(pointer: *mut u8, len: u32) {
-    if !pointer.is_null() {
-        drop(Vec::from_raw_parts(pointer, 0, len as usize));
+/// `pointer` must be null or point to a NUL-terminated string.
+unsafe fn argument<'a>(pointer: *const c_char, name: &str) -> Result<&'a str, Value> {
+    if pointer.is_null() {
+        return Err(invalid(format!("{name} is NULL")));
     }
+    CStr::from_ptr(pointer)
+        .to_str()
+        .map_err(|_| invalid(format!("{name} is not UTF-8")))
 }
 
-/// Runs `operation` on the JSON `request` and returns the response buffer as
-/// `(pointer << 32) | length`.
+/// Runs `operation` on the JSON `request` and returns the JSON response as a
+/// NUL-terminated string owned by the caller; release it with
+/// [`sqlscope_free`]. Never returns NULL.
 ///
 /// # Safety
-/// The pointer/length pairs must describe live, initialized buffers.
+/// `operation` and `request` must be null or point to NUL-terminated strings.
 #[no_mangle]
-pub unsafe extern "C" fn sqlscope_call(op: *const u8, op_len: u32, request: *const u8, request_len: u32) -> u64 {
-    let operation = std::slice::from_raw_parts(op, op_len as usize);
-    let request = std::slice::from_raw_parts(request, request_len as usize);
-    let response = match std::str::from_utf8(operation) {
-        Ok(operation) => execute(operation, request),
-        Err(_) => invalid("operation name is not UTF-8".to_owned()),
-    };
-    let mut bytes = serde_json::to_vec(&response).expect("serializable response");
-    bytes.shrink_to_fit();
-    let len = bytes.len() as u64;
-    let pointer = bytes.as_mut_ptr() as u64;
-    std::mem::forget(bytes);
-    (pointer << 32) | len
+pub unsafe extern "C" fn sqlscope_call(operation: *const c_char, request: *const c_char) -> *mut c_char {
+    let response = catch_unwind(AssertUnwindSafe(|| {
+        let operation = argument(operation, "operation")?;
+        let request = argument(request, "request")?;
+        Ok(execute(operation, request.as_bytes()))
+    }))
+    .unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_owned());
+        Ok(json!({"error": {"kind": "internal", "message": format!("panic: {message}")}}))
+    })
+    .unwrap_or_else(|error: Value| error);
+    // serde_json escapes control characters, so the response has no NUL.
+    let bytes = serde_json::to_vec(&response).expect("serializable response");
+    CString::new(bytes).expect("JSON has no NUL").into_raw()
+}
+
+/// Releases a response returned by [`sqlscope_call`]. NULL is ignored.
+///
+/// # Safety
+/// `response` must be null or a pointer returned by [`sqlscope_call`] that
+/// has not been released yet.
+#[no_mangle]
+pub unsafe extern "C" fn sqlscope_free(response: *mut c_char) {
+    if !response.is_null() {
+        drop(CString::from_raw(response));
+    }
 }
 
 #[cfg(test)]
@@ -309,5 +328,34 @@ mod tests {
             kind("apply_row_filter", br#"{"sql": "DELETE FROM t", "predicate": "x"}"#),
             "unsupported"
         );
+    }
+
+    #[test]
+    fn c_abi_round_trip() {
+        let call = |operation: *const c_char, request: *const c_char| unsafe {
+            let response = sqlscope_call(operation, request);
+            let value: Value = serde_json::from_slice(CStr::from_ptr(response).to_bytes()).unwrap();
+            sqlscope_free(response);
+            value
+        };
+        let op = c"output_columns";
+        assert_eq!(
+            call(op.as_ptr(), c"{\"sql\": \"SELECT a, b AS c FROM t\"}".as_ptr()),
+            json!({"ok": ["a", "c"]})
+        );
+        assert_eq!(
+            call(std::ptr::null(), c"{}".as_ptr())["error"]["kind"],
+            "invalid_argument"
+        );
+        assert_eq!(call(op.as_ptr(), std::ptr::null())["error"]["kind"], "invalid_argument");
+        assert_eq!(
+            call(op.as_ptr(), c"{\"sql\": \"\xff\"}".as_ptr())["error"]["kind"],
+            "invalid_argument"
+        );
+        unsafe { sqlscope_free(std::ptr::null_mut()) };
+
+        let version = unsafe { CStr::from_ptr(sqlscope_version()) };
+        assert_eq!(version.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(sqlscope_abi_version(), ABI_VERSION);
     }
 }

@@ -13,7 +13,8 @@ const (
 	// KindUnsupported: the statement shape is not supported, or the input
 	// exceeded a safety limit.
 	KindUnsupported Kind = "unsupported"
-	// KindInternal: sqlscope produced an invalid result or its engine failed.
+	// KindInternal: sqlscope produced an invalid result, or its library
+	// could not be loaded.
 	KindInternal Kind = "internal"
 )
 
