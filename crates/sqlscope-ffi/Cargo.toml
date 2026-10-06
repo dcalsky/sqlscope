@@ -10,7 +10,7 @@ publish = false
 
 [lib]
 name = "sqlscope_ffi"
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 sqlscope = { path = "../sqlscope" }

@@ -39,6 +39,9 @@ jobs:
         run: cargo clippy --workspace --all-targets
       - name: Test
         run: cargo test --workspace
+      - name: Feature gates
+        if: runner.os == 'Linux'
+        run: make test-feature-gates
       - name: Docs
         if: runner.os == 'Linux'
         env:
@@ -59,7 +62,7 @@ jobs:
           LD_LIBRARY_PATH=ffi DYLD_LIBRARY_PATH=ffi ./smoke
       - uses: actions/upload-artifact@v4
         with:
-          name: ffi-${{ matrix.os }}
+          name: ci-ffi-${{ matrix.os }}
           path: ffi
 
   msrv:
@@ -92,7 +95,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ffi-${{ matrix.os }}
+          name: ci-ffi-${{ matrix.os }}
           path: ffi
       - uses: actions/setup-go@v5
         with:
@@ -125,7 +128,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ffi-${{ matrix.os }}
+          name: ci-ffi-${{ matrix.os }}
           path: ffi
       - uses: actions/setup-python@v5
         with:

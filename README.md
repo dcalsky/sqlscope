@@ -197,18 +197,16 @@ returning it; when nothing needs rewriting, the input is returned unchanged.
 ## Development
 
 ```bash
-cargo test --workspace                                # Rust
-cargo build -p sqlscope-ffi                           # FFI library for the SDKs
-export SQLSCOPE_LIBRARY_PATH="$PWD/target/debug/libsqlscope_ffi.dylib"  # .so on Linux
-(cd go && go test ./...)                              # Go
-(cd python && python -m pytest)                       # Python (needs pytest)
+make check                     # rustfmt, clippy, go vet + Rust, feature-gate, C, Go, Python tests
+make test-go FFI_DIR=target/ffi  # run an SDK against the release-profile library
+make help                      # every target
 ```
 
-`cargo build -p sqlscope-ffi --profile ffi` produces the optimized libraries
-that releases ship.
+The SDK tests build the debug FFI library and point `SQLSCOPE_LIBRARY_PATH`
+at it. `make build-ffi-release` builds the size-optimized libraries that
+releases ship (`target/ffi`).
 
-To release, bump `version` in the root `Cargo.toml` and `__version__` in
-`python/src/sqlscope/__init__.py`, then tag:
+To release, run `make bump-version V=X.Y.Z`, merge it to `main`, then tag:
 `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow runs CI,
 builds and tests the FFI library on every platform, attaches the archives
 and checksums to a GitHub release, publishes the pure-Python package to PyPI

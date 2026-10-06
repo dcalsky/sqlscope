@@ -141,9 +141,9 @@ jobs:
       - name: Archive
         run: |
           if [[ "${{ runner.os }}" == Windows ]]; then
-            7z a -tzip "$DIST.zip" "$DIST"
+            7z a -tzip -mx=9 "$DIST.zip" "$DIST"
           else
-            tar -czf "$DIST.tar.gz" "$DIST"
+            tar -cf - "$DIST" | gzip -9 > "$DIST.tar.gz"
           fi
       - uses: actions/upload-artifact@v4
         with:
