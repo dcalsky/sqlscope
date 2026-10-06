@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sqlscope", "crates/sqlscope-json", "crates/sqlscope-ffi", "crates/sqlscope-wasm"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"

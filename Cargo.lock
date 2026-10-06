@@ -220,7 +220,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sqlscope"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "polyglot-sql",
  "regex",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "sqlscope-ffi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
  "sqlscope-json",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "sqlscope-json"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "sqlscope-wasm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
  "sqlscope-json",
