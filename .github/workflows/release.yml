@@ -82,9 +82,11 @@ jobs:
       - name: Build
         env:
           RUSTFLAGS: --print=native-static-libs
+          CARGO_TERM_COLOR: never
         run: |
           cargo build -p sqlscope-ffi --profile ffi --locked --target ${{ matrix.target }} 2>&1 | tee build.log
-          sed -n 's/.*note: native-static-libs: //p' build.log | tail -1 > native-static-libs.txt
+          sed 's/\x1b\[[0-9;]*m//g' build.log | sed -n 's/.*note: native-static-libs: //p' | tail -1 | tr -d '\r' > native-static-libs.txt
+          cat native-static-libs.txt
           test -s native-static-libs.txt
       - name: Package
         env:
