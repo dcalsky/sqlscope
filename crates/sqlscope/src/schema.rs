@@ -8,8 +8,10 @@ use crate::ast::has_table_suffix;
 
 pub(crate) type Schema = BTreeMap<String, Vec<String>>;
 
-/// The schema key for `table`: an exact key, or the unique key that has
-/// `table` as a dot-boundary suffix.
+/// The schema key for `table`: an exact key; else the unique key that has
+/// `table` as a dot-boundary suffix (`orders` -> `sales.orders`); else the
+/// longest key that is itself a suffix of `table` (`public.orders` ->
+/// `orders`). Suffixes of one name nest, so the longest is unique.
 pub(crate) fn key_for<'s>(schema: &'s Schema, table: &str) -> Option<&'s String> {
     if table.is_empty() {
         return None;
@@ -20,7 +22,11 @@ pub(crate) fn key_for<'s>(schema: &'s Schema, table: &str) -> Option<&'s String>
     let mut candidates = schema.keys().filter(|key| has_table_suffix(key, table));
     match (candidates.next(), candidates.next()) {
         (Some(key), None) => Some(key),
-        _ => None,
+        (Some(_), Some(_)) => None,
+        _ => schema
+            .keys()
+            .filter(|key| has_table_suffix(table, key))
+            .max_by_key(|key| key.len()),
     }
 }
 

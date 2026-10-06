@@ -109,9 +109,11 @@ impl Options {
     /// names.
     ///
     /// Keys may be bare (`orders`), schema-qualified (`sales.orders`) or
-    /// catalog-qualified (`hive.sales.orders`); a qualified query reference
-    /// also matches a key that is a dot-boundary suffix of it, and vice versa,
-    /// when that match is unique. The schema expands wildcards and attributes
+    /// catalog-qualified (`hive.sales.orders`). A reference without an exact
+    /// key matches the key it is a dot-boundary suffix of when that key is
+    /// unique (`orders` -> `sales.orders`), otherwise the longest key that is a
+    /// suffix of it (`public.orders` -> `orders`). Column names are used as
+    /// given. The schema expands wildcards and attributes
     /// unqualified columns. A table listed with no columns is known to have
     /// zero columns; a table that is absent is unknown.
     pub fn schema<K, C, S>(mut self, schema: impl IntoIterator<Item = (K, C)>) -> Self

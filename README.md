@@ -146,6 +146,12 @@ are ignored.
 `schema` maps table names (bare, `schema.table` or `catalog.schema.table`) to
 their ordered columns. It expands `*` and attributes unqualified columns. A
 table listed with no columns has zero columns; an unlisted table is unknown.
+A reference matches its exact key, else the unique key it is a suffix of
+(`orders` -> `sales.orders`), else the longest key that is a suffix of it
+(`public.orders` -> `orders`).
+
+In BigQuery a quoted path such as `` `proj.ds.orders` `` is read as
+`` `proj`.`ds`.`orders` `` by every operation.
 
 ## Operations
 
@@ -187,7 +193,9 @@ Filter-only positions (`WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, top-level
 ### `output_columns(sql)`
 
 Output column names in order. Unaliased expressions are `_col{i}`; `*`
-expands from the schema or stays `"*"`. Explicit column lists on views,
+expands from the schema, CTEs and derived tables, or stays `"*"`, and applies
+`EXCEPT`/`EXCLUDE`, `REPLACE` and `RENAME`. Columns shared by `USING` or
+`NATURAL` joins appear once. Explicit column lists on views,
 `CREATE TABLE` and `INSERT` win. `CREATE TABLE (... LIKE t ...)` needs `t`'s
 schema. Returns none for statements without columns.
 

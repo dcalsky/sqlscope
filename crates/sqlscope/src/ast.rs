@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem::{discriminant, Discriminant};
 
-use polyglot_sql::expressions::{Identifier, TableRef, With};
+use polyglot_sql::expressions::{Column, DotAccess, Identifier, TableRef, With};
 use polyglot_sql::{traversal::transform_all, ComplexityGuardOptions, Expression, ExpressionWalk, ParseOptions};
 
 use crate::error::{Error, Result};
@@ -51,7 +51,111 @@ fn parse_options() -> ParseOptions {
 /// Parses `sql` into its statements.
 pub(crate) fn parse(sql: &str, dialect: Dialect) -> Result<Vec<Expression>> {
     guard_input(sql)?;
-    polyglot_sql::parse_with_options(sql, dialect.polyglot(), &parse_options()).map_err(classify_parse_error)
+    let statements =
+        polyglot_sql::parse_with_options(sql, dialect.polyglot(), &parse_options()).map_err(classify_parse_error)?;
+    if dialect != Dialect::BIGQUERY {
+        return Ok(statements);
+    }
+    statements.into_iter().map(split_bigquery_paths).collect()
+}
+
+/// BigQuery reads a quoted table name containing dots as a path:
+/// `` `proj.ds.orders` `` is `proj`.`ds`.`orders`. The parser keeps it as one
+/// identifier, which would hide the dataset and project from name matching,
+/// so every table reference, and every column or star qualifier written the
+/// same way, is split into its parts.
+fn split_bigquery_paths(statement: Expression) -> Result<Expression> {
+    with_large_stack(|| {
+        transform_all(statement, &|mut node| {
+            match &mut node {
+                Expression::Table(table) => split_bigquery_path(table),
+                Expression::Update(update) => {
+                    split_bigquery_path(&mut update.table);
+                    update.extra_tables.iter_mut().for_each(split_bigquery_path);
+                }
+                Expression::Delete(delete) => {
+                    split_bigquery_path(&mut delete.table);
+                    delete.using.iter_mut().for_each(split_bigquery_path);
+                    delete.tables.iter_mut().for_each(split_bigquery_path);
+                }
+                Expression::Insert(insert) => split_bigquery_path(&mut insert.table),
+                Expression::Column(column) => {
+                    if let Some(chain) = column.table.as_ref().and_then(dotted_parts) {
+                        return Ok(dot_chain(chain, column.name.clone()));
+                    }
+                }
+                Expression::Star(star) => {
+                    // A star qualifier is one identifier whose unquoted dots
+                    // separate the parts.
+                    if let Some(table) = star.table.as_mut().filter(|t| t.quoted && t.name.contains('.')) {
+                        table.quoted = false;
+                    }
+                }
+                _ => {}
+            }
+            Ok(node)
+        })
+    })
+    .map_err(|error| Error::internal(format!("AST transform failed: {error}")))
+}
+
+/// The parts of a quoted, dotted identifier (`` `proj.ds.orders` ``).
+fn dotted_parts(identifier: &Identifier) -> Option<Vec<Identifier>> {
+    if !identifier.quoted || !identifier.name.contains('.') {
+        return None;
+    }
+    let parts: Vec<Identifier> = identifier.name.split('.').map(Identifier::quoted).collect();
+    (parts.len() <= 3 && parts.iter().all(|part| !part.name.is_empty())).then_some(parts)
+}
+
+/// `a.b.c` + `field` as a column reference followed by field accesses, the
+/// shape the parser gives an unquoted `a.b.c.field`.
+fn dot_chain(mut qualifier: Vec<Identifier>, field: Identifier) -> Expression {
+    let rest = qualifier.split_off(2.min(qualifier.len()));
+    let mut parts = qualifier.into_iter();
+    let first = parts.next().expect("a dotted name has two parts");
+    let second = parts.next().expect("a dotted name has two parts");
+    let mut expression = Expression::Column(Box::new(Column {
+        name: second,
+        table: Some(first),
+        join_mark: false,
+        trailing_comments: Vec::new(),
+        span: None,
+        inferred_type: None,
+    }));
+    for part in rest.into_iter().chain([field]) {
+        expression = Expression::Dot(Box::new(DotAccess {
+            this: expression,
+            field: part,
+            inferred_type: None,
+        }));
+    }
+    expression
+}
+
+fn split_bigquery_path(table: &mut TableRef) {
+    let written = [table.catalog.as_ref(), table.schema.as_ref(), Some(&table.name)];
+    if !written
+        .iter()
+        .flatten()
+        .any(|identifier| dotted_parts(identifier).is_some())
+    {
+        return;
+    }
+    let mut parts: Vec<Identifier> = Vec::with_capacity(3);
+    for identifier in written.into_iter().flatten() {
+        match dotted_parts(identifier) {
+            Some(split) => parts.extend(split),
+            None if !identifier.name.is_empty() => parts.push(identifier.clone()),
+            None => {}
+        }
+    }
+    if parts.len() > 3 {
+        return; // not a project.dataset.table path; leave it as written
+    }
+    table.name = parts.pop().expect("a dotted name has two parts");
+    table.schema = parts.pop();
+    table.catalog = parts.pop();
 }
 
 /// Parses `sql`, which must contain exactly one statement.

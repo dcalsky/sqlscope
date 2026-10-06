@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use polyglot_sql::expressions::{
-    Column, Delete, Identifier, Literal, Merge, Ordered, Select, Star, Subquery, TableRef, Update, With,
+    Column, Delete, Identifier, JoinKind, Literal, Merge, Ordered, Select, Star, Subquery, TableRef, Update, With,
 };
 use polyglot_sql::{Expression, ExpressionWalk};
 
@@ -34,6 +34,10 @@ pub(crate) struct Output {
     pub(crate) names: Vec<String>,
     pub(crate) by_name: HashMap<String, Vec<ColRef>>,
     pub(crate) positions: Vec<Vec<ColRef>>,
+    /// For a SELECT (or a set operation, from its left branch): how many
+    /// positions each projection item produced, in order. A star produces
+    /// one per expanded column.
+    pub(crate) items: Vec<usize>,
 }
 
 impl Output {
@@ -67,8 +71,16 @@ impl Output {
 }
 
 enum Source {
-    Physical { table: String },
-    Derived { out: Rc<Output>, roots: Vec<String> },
+    Physical {
+        table: String,
+    },
+    Derived {
+        out: Rc<Output>,
+        roots: Vec<String>,
+    },
+    /// A relation whose columns are unknown and read no table directly: a
+    /// table function, UNNEST or lateral view.
+    Opaque,
 }
 
 impl Source {
@@ -76,8 +88,18 @@ impl Source {
         match self {
             Source::Physical { table } => vec![table.clone()],
             Source::Derived { roots, .. } => roots.clone(),
+            Source::Opaque => Vec::new(),
         }
     }
+}
+
+/// How a joined relation shares columns with the relations before it.
+#[derive(Clone)]
+enum SharedColumns {
+    /// `JOIN ... USING (k, ...)`.
+    Using(Vec<String>),
+    /// `NATURAL JOIN`: every column whose name is already present.
+    Natural,
 }
 
 struct CteEntry<'a> {
@@ -94,6 +116,9 @@ struct CteEntry<'a> {
 struct Scope<'a> {
     sources: RefCell<Vec<Rc<Source>>>,
     by_alias: RefCell<HashMap<String, Rc<Source>>>,
+    /// Source index -> the columns it shares with earlier sources, which an
+    /// unqualified `*` outputs once.
+    shared: RefCell<HashMap<usize, SharedColumns>>,
     ctes: HashMap<String, Rc<CteEntry<'a>>>,
     parent: Option<Rc<Scope<'a>>>,
     /// FROM-position wrappers (UNNEST, PIVOT arguments, table functions)
@@ -116,7 +141,7 @@ impl<'a> Scope<'a> {
             .iter()
             .filter_map(|source| match source.as_ref() {
                 Source::Physical { table } => Some(table.clone()),
-                Source::Derived { .. } => None,
+                Source::Derived { .. } | Source::Opaque => None,
             })
             .collect()
     }
@@ -408,7 +433,27 @@ impl<'a, 's> Resolver<'a, 's> {
                 self.add_source(entry, &scope);
             }
             for join in &select.joins {
+                let first = scope.sources.borrow().len();
                 self.add_source(&join.this, &scope);
+                let shared = if matches!(
+                    join.kind,
+                    JoinKind::Natural | JoinKind::NaturalLeft | JoinKind::NaturalRight | JoinKind::NaturalFull
+                ) {
+                    Some(SharedColumns::Natural)
+                } else if !join.using.is_empty() {
+                    Some(SharedColumns::Using(names(&join.using)))
+                } else {
+                    None
+                };
+                if let Some(shared) = shared {
+                    let added = scope.sources.borrow().len();
+                    for index in first..added {
+                        scope.shared.borrow_mut().insert(index, shared.clone());
+                    }
+                }
+            }
+            if !select.lateral_views.is_empty() {
+                scope.push(None, Source::Opaque);
             }
             if !self.flow_only {
                 self.collect_deferred(&scope);
@@ -494,6 +539,7 @@ impl<'a, 's> Resolver<'a, 's> {
 
         let mut out = Output {
             names: left.names.clone(),
+            items: left.items.clone(),
             ..Output::default()
         };
         for (index, name) in left.names.iter().enumerate() {
@@ -545,7 +591,10 @@ impl<'a, 's> Resolver<'a, 's> {
                 scope.deferred.borrow_mut().extend(unpivot.columns.iter());
             }
             Expression::Paren(paren) => self.add_source(&paren.this, scope),
-            _ => scope.deferred.borrow_mut().push(entry),
+            _ => {
+                scope.deferred.borrow_mut().push(entry);
+                scope.push(None, Source::Opaque);
+            }
         }
     }
 
@@ -600,6 +649,7 @@ impl<'a, 's> Resolver<'a, 's> {
     fn build_output(&mut self, expressions: &'a [Expression], scope: &Rc<Scope<'a>>) -> Output {
         let mut out = Output::default();
         for item in expressions {
+            let before = out.positions.len();
             match item {
                 Expression::Star(star) => {
                     for (name, refs) in self.expand_star(star, scope) {
@@ -630,11 +680,49 @@ impl<'a, 's> Resolver<'a, 's> {
                     }
                 }
             }
+            out.items.push(out.positions.len() - before);
         }
         out
     }
 
-    fn expand_star(&mut self, star: &Star, scope: &Rc<Scope<'a>>) -> Vec<(String, Vec<ColRef>)> {
+    /// Expands `*` / `t.*` into `(name, refs)` pairs, applying the star's
+    /// EXCEPT / EXCLUDE, REPLACE and RENAME modifiers. An unknown relation
+    /// yields the `*` sentinel.
+    fn expand_star(&mut self, star: &'a Star, scope: &Rc<Scope<'a>>) -> Vec<(String, Vec<ColRef>)> {
+        let mut columns = self.star_columns(star, scope);
+        let matches = |identifier: &Identifier, name: &str| {
+            if identifier.quoted {
+                identifier.name == name
+            } else {
+                identifier.name.eq_ignore_ascii_case(name)
+            }
+        };
+        if let Some(except) = &star.except {
+            columns.retain(|(name, _)| name == "*" || !except.iter().any(|excluded| matches(excluded, name)));
+        }
+        let mut replaced = vec![false; columns.len()];
+        for replacement in star.replace.iter().flatten() {
+            if let Some(index) = columns.iter().position(|(name, _)| matches(&replacement.alias, name)) {
+                // collect_refs records the replacement's own references.
+                columns[index].1 = self.collect_refs(&replacement.this, scope, Clause::Select);
+                replaced[index] = true;
+            }
+        }
+        for (index, (_, refs)) in columns.iter().enumerate() {
+            if !replaced[index] {
+                self.add_refs(refs, Clause::Select);
+            }
+        }
+        for (from, to) in star.rename.iter().flatten() {
+            if let Some(column) = columns.iter_mut().find(|(name, _)| matches(from, name)) {
+                column.0 = to.name.clone();
+            }
+        }
+        columns
+    }
+
+    /// The unmodified columns a star stands for, without recording them.
+    fn star_columns(&self, star: &Star, scope: &Rc<Scope<'a>>) -> Vec<(String, Vec<ColRef>)> {
         let mut out = Vec::new();
         let qualifier = star
             .table
@@ -642,32 +730,51 @@ impl<'a, 's> Resolver<'a, 's> {
             .map(|table| table.name.to_lowercase())
             .unwrap_or_default();
 
-        let emit = |resolver: &mut Self, source: &Source, out: &mut Vec<(String, Vec<ColRef>)>| match source {
+        let emit = |source: &Source, out: &mut Vec<(String, Vec<ColRef>)>| match source {
             Source::Derived { out: derived, .. } => {
                 for name in &derived.names {
                     let refs = derived.refs(name).cloned().unwrap_or_default();
-                    resolver.add_refs(&refs, Clause::Select);
                     out.push((name.clone(), refs));
                 }
             }
-            Source::Physical { table } => match schema::columns(resolver.schema, table) {
+            Source::Physical { table } => match schema::columns(self.schema, table) {
                 Some(columns) => {
                     for column in columns.iter().cloned() {
-                        resolver.add(table, &column, Clause::Select);
                         out.push((column.clone(), vec![(table.clone(), column)]));
                     }
                 }
-                None => {
-                    resolver.add(table, "*", Clause::Select);
-                    out.push(("*".to_owned(), vec![(table.clone(), "*".to_owned())]));
-                }
+                None => out.push(("*".to_owned(), vec![(table.clone(), "*".to_owned())])),
             },
+            Source::Opaque => out.push(("*".to_owned(), Vec::new())),
         };
 
         if qualifier.is_empty() {
-            let sources = scope.sources.borrow().clone();
-            for source in &sources {
-                emit(self, source, &mut out);
+            let shared = scope.shared.borrow();
+            for (index, source) in scope.sources.borrow().iter().enumerate() {
+                let Some(shared) = shared.get(&index) else {
+                    emit(source, &mut out);
+                    continue;
+                };
+                let mut columns = Vec::new();
+                emit(source, &mut columns);
+                for (name, refs) in columns {
+                    let is_shared = name != "*"
+                        && match shared {
+                            SharedColumns::Using(using) => {
+                                using.iter().any(|column| column.eq_ignore_ascii_case(&name))
+                            }
+                            SharedColumns::Natural => true,
+                        };
+                    // A shared column is output once; its value may come from
+                    // either side.
+                    match out
+                        .iter_mut()
+                        .find(|(existing, _)| is_shared && existing.eq_ignore_ascii_case(&name))
+                    {
+                        Some((_, existing)) => existing.extend(refs),
+                        None => out.push((name, refs)),
+                    }
+                }
             }
             return out;
         }
@@ -677,7 +784,20 @@ impl<'a, 's> Resolver<'a, 's> {
         while let Some(level) = current {
             let source = level.by_alias.borrow().get(&qualifier).cloned();
             if let Some(source) = source {
-                emit(self, &source, &mut out);
+                emit(&source, &mut out);
+                return out;
+            }
+            // A qualified star (`raw.users.*`) names a physical table.
+            let mut matched: Vec<String> = Vec::new();
+            for table in level.physical_tables() {
+                if table_names_match(&qualifier, &table.to_lowercase()) && !matched.contains(&table) {
+                    matched.push(table);
+                }
+            }
+            if !matched.is_empty() {
+                for table in matched {
+                    emit(&Source::Physical { table }, &mut out);
+                }
                 return out;
             }
             current = level.parent.clone();
@@ -688,7 +808,6 @@ impl<'a, 's> Resolver<'a, 's> {
             roots.push(qualifier);
         }
         for root in roots {
-            self.add(&root, "*", Clause::Select);
             out.push(("*".to_owned(), vec![(root, "*".to_owned())]));
         }
         out
@@ -824,6 +943,8 @@ impl<'a, 's> Resolver<'a, 's> {
                     // A name missing from a derived output (an unexpanded
                     // star) is attributed to the derived source's roots.
                     Source::Derived { out, roots } => out.refs(name).cloned().unwrap_or_else(|| refs_for(roots, name)),
+                    // Never registered under an alias; fail open regardless.
+                    Source::Opaque => refs_for(&scope.chain_roots(), name),
                 };
             }
             let mut matched: Vec<String> = Vec::new();
@@ -852,10 +973,15 @@ impl<'a, 's> Resolver<'a, 's> {
         }
         let mut refs = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
+        // Whether some source exposes the name. A derived column computed
+        // without column inputs (`count(*) AS n`) has no refs but still binds
+        // the name, so it must not fall through to the fallbacks below.
+        let mut bound = false;
         for source in scope.sources.borrow().iter() {
             match source.as_ref() {
                 Source::Derived { out, roots } => {
                     if let Some(found) = out.refs(name) {
+                        bound = true;
                         refs.extend(found.iter().cloned());
                     } else if out.by_name.contains_key("*") {
                         // An unexpanded star may expose the name.
@@ -870,6 +996,8 @@ impl<'a, 's> Resolver<'a, 's> {
                     }
                     None => unknown.push(table.clone()),
                 },
+                // Columns of table functions are not attributed to tables.
+                Source::Opaque => {}
             }
         }
         let mut distinct: Vec<String> = Vec::new();
@@ -879,7 +1007,7 @@ impl<'a, 's> Resolver<'a, 's> {
             }
         }
         refs.extend(refs_for(&distinct, name));
-        if !refs.is_empty() {
+        if bound || !refs.is_empty() {
             return refs;
         }
         // Every current source is fully known and none has the name: SQL
