@@ -141,3 +141,34 @@ jobs:
           python -m pytest -q
       - name: Type check
         run: python -m mypy --strict src/sqlscope
+
+  typescript:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - name: Read wasm-bindgen version
+        id: wasm-bindgen
+        run: echo "version=$(sed -n '/^name = "wasm-bindgen"$/{n;s/^version = "\(.*\)"/\1/p;}' Cargo.lock)" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+      - name: Build
+        run: make build-typescript
+      - name: Type check
+        working-directory: typescript
+        run: npm run typecheck
+      - name: Test
+        working-directory: typescript
+        run: npm test

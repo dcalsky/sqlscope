@@ -1,0 +1,18 @@
+[package]
+name = "sqlscope-json"
+description = "JSON protocol shared by the sqlscope C ABI and WebAssembly module"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = ["stacker"]
+stacker = ["sqlscope/stacker"]
+
+[dependencies]
+sqlscope = { path = "../sqlscope", default-features = false }
+serde.workspace = true
+serde_json.workspace = true

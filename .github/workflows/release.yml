@@ -8,16 +8,26 @@ name: Release
 #     release;
 #   - publishes the pure-Python SDK to PyPI as `sqlscope-rs` (trusted
 #     publishing, `pypi` environment; it contains no native code);
+#   - stages the TypeScript SDK on npm as `sqlscope-rs` (secret
+#     NPM_ACCESS_TOKEN, with provenance); a maintainer publishes it with
+#     `npm stage approve` or the package's "Staged Packages" tab, which asks
+#     for 2FA. It bundles sqlscope compiled to WebAssembly;
 #   - tags the Go module as go/vX.Y.Z;
 #   - publishes the crate to crates.io when vars.PUBLISH_CRATES is 'true'.
 # The Python and Go SDKs load the FFI libraries at runtime and never bundle
 # or download them. Running it manually (workflow_dispatch) builds everything
-# without publishing.
+# without publishing, except that the publish-npm input stages the npm
+# package of the workspace version when that version is not on npm yet.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish-npm:
+        description: Stage the npm package of the workspace version
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -38,9 +48,14 @@ jobs:
         run: |
           version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
           python_version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' python/src/sqlscope/__init__.py)"
+          npm_version="$(jq -r .version typescript/package.json)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if [[ "$python_version" != "$version" ]]; then
             echo "::error::python/src/sqlscope/__init__.py version $python_version does not match workspace version $version"
+            exit 1
+          fi
+          if [[ "$npm_version" != "$version" ]]; then
+            echo "::error::typescript/package.json version $npm_version does not match workspace version $version"
             exit 1
           fi
           if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
@@ -185,6 +200,44 @@ jobs:
           name: python-dist
           path: python/dist
 
+  npm-package:
+    name: npm package
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Read wasm-bindgen version
+        id: wasm-bindgen
+        run: echo "version=$(sed -n '/^name = "wasm-bindgen"$/{n;s/^version = "\(.*\)"/\1/p;}' Cargo.lock)" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
+      - name: Install wasm-opt
+        run: |
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-x86_64-linux.tar.gz | tar -xz
+          echo "$PWD/binaryen-version_133/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build
+        run: make build-typescript
+      - name: Test
+        working-directory: typescript
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          npm run typecheck
+          npm test
+          npm pack --pack-destination dist
+          test -f "dist/sqlscope-rs-$VERSION.tgz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: typescript/dist/*.tgz
+
   pypi:
     name: Publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
@@ -201,6 +254,37 @@ jobs:
           name: python-dist
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  npm:
+    name: Stage on npm
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish-npm
+    needs: [version, ci, ffi, npm-package]
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/sqlscope-rs
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Staged publishing needs npm >= 11.15.
+      - run: npm install --global npm@^11.15
+      - name: Stage
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if npm view "sqlscope-rs@$VERSION" version >/dev/null 2>&1; then
+            echo "sqlscope-rs@$VERSION is already published"
+            exit 0
+          fi
+          npm stage publish "sqlscope-rs-$VERSION.tgz" --access public --provenance
 
   github-release:
     name: GitHub release

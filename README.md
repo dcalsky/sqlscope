@@ -1,6 +1,6 @@
 # sqlscope
 
-Scope-aware SQL analysis and rewriting for Rust, Python and Go, built on the
+Scope-aware SQL analysis and rewriting for Rust, Python, Go and TypeScript, built on the
 [polyglot](https://github.com/tobilg/polyglot) SQL engine (30+ dialects).
 
 | Operation | Purpose |
@@ -39,9 +39,13 @@ library in the Python package directory (Python) or next to the executable
 | C / C++ / others | link `sqlscope-ffi` from a release; see `sqlscope.h` |
 | Python | `pip install sqlscope-rs` (imported as `sqlscope`; pure Python, ≥ 3.9) |
 | Go | `go get github.com/dcalsky/sqlscope/go` (no cgo; uses [purego](https://github.com/ebitengine/purego)) |
+| TypeScript / JavaScript | `npm install sqlscope-rs` (WebAssembly; Node.js ≥ 20.19, Deno, Bun, browsers) |
 
 Use the SDK and library from the same release; they check the ABI version
 when loading.
+
+The TypeScript SDK is the exception: it bundles sqlscope compiled to
+WebAssembly, so there is no library to install.
 
 ## Usage
 
@@ -93,6 +97,22 @@ cols, err := sqlscope.ColumnOrigins(sql,
     sqlscope.WithSchema(map[string][]string{"orders": {"id", "tenant_id"}}))
 ```
 
+### TypeScript
+
+```ts
+import { applyRowFilter, columnUsages } from "sqlscope-rs";
+
+applyRowFilter("SELECT id FROM orders", "tenant_id = 7", { dialect: "postgres" });
+// 'SELECT id FROM (SELECT * FROM orders WHERE tenant_id = 7) AS orders'
+
+columnUsages("SELECT id FROM orders WHERE status = 'PAID'");
+// [{ table: 'orders', column: 'id', clause: 'SELECT' },
+//  { table: 'orders', column: 'status', clause: 'WHERE' }]
+```
+
+Node.js, Deno and Bun load the WebAssembly module on import. In browsers,
+`await init()` once first; see [typescript/README.md](typescript/README.md).
+
 ### C
 
 ```c
@@ -114,14 +134,14 @@ listed in the README inside each release archive.
 Every operation takes the same options. Settings an operation does not read
 are ignored.
 
-| Rust (`Options::`) | Python keyword | Go | Read by |
-| --- | --- | --- | --- |
-| `dialect` | `dialect` | `WithDialect` | all (default `trino`) |
-| `schema` | `schema` | `WithSchema` | `column_origins`, `output_columns`, `referenced_columns`, `column_usages` |
-| `table_names` | `table_names` | `WithTableNames` | `apply_row_filter` |
-| `table_patterns` | `table_patterns` | `WithTableRegexp` | `apply_row_filter` |
-| `default_db` | `default_db` | `WithDefaultDB` | `apply_row_filter` |
-| `strip_catalogs` | `strip_catalogs` | `WithStripCatalogs` | `rewrite_tables` |
+| Rust (`Options::`) | Python keyword | Go | TypeScript option | Read by |
+| --- | --- | --- | --- | --- |
+| `dialect` | `dialect` | `WithDialect` | `dialect` | all (default `trino`) |
+| `schema` | `schema` | `WithSchema` | `schema` | `column_origins`, `output_columns`, `referenced_columns`, `column_usages` |
+| `table_names` | `table_names` | `WithTableNames` | `tableNames` | `apply_row_filter` |
+| `table_patterns` | `table_patterns` | `WithTableRegexp` | `tablePatterns` | `apply_row_filter` |
+| `default_db` | `default_db` | `WithDefaultDB` | `defaultDb` | `apply_row_filter` |
+| `strip_catalogs` | `strip_catalogs` | `WithStripCatalogs` | `stripCatalogs` | `rewrite_tables` |
 
 `schema` maps table names (bare, `schema.table` or `catalog.schema.table`) to
 their ordered columns. It expands `*` and attributes unqualified columns. A
@@ -182,12 +202,15 @@ attributed precisely is attributed to every candidate table, never dropped.
 
 ## Errors
 
-| Kind | Rust `ErrorKind` | Python | Go |
-| --- | --- | --- | --- |
-| Invalid option or argument | `InvalidArgument` | `InvalidArgumentError` | `ErrInvalidArgument` |
-| SQL does not parse | `Parse` | `ParseError` | `ErrParse` |
-| Unsupported statement or input over a safety limit | `Unsupported` | `UnsupportedError` | `ErrUnsupported` |
-| Bug (invalid output) | `Internal` | `InternalError` | `ErrInternal` |
+| Kind | Rust `ErrorKind` | Python | Go | TypeScript |
+| --- | --- | --- | --- | --- |
+| Invalid option or argument | `InvalidArgument` | `InvalidArgumentError` | `ErrInvalidArgument` | `InvalidArgumentError` |
+| SQL does not parse | `Parse` | `ParseError` | `ErrParse` | `ParseError` |
+| Unsupported statement or input over a safety limit | `Unsupported` | `UnsupportedError` | `ErrUnsupported` | `UnsupportedError` |
+| Bug (invalid output) | `Internal` | `InternalError` | `ErrInternal` | `InternalError` |
+
+TypeScript functions are camelCase (`applyRowFilter`, `columnOrigins`, ...)
+and every error extends `SqlscopeError`.
 
 Input is limited to 1 MiB and 256 levels of parser nesting on every platform.
 Rewrites regenerate SQL from the AST (normalized formatting, comments
@@ -197,20 +220,26 @@ returning it; when nothing needs rewriting, the input is returned unchanged.
 ## Development
 
 ```bash
-make check                     # rustfmt, clippy, go vet + Rust, feature-gate, C, Go, Python tests
+make check                     # rustfmt, clippy, go vet, tsc + Rust, feature-gate, C, Go, Python, TypeScript tests
 make test-go FFI_DIR=target/ffi  # run an SDK against the release-profile library
 make help                      # every target
 ```
 
 The SDK tests build the debug FFI library and point `SQLSCOPE_LIBRARY_PATH`
 at it. `make build-ffi-release` builds the size-optimized libraries that
-releases ship (`target/ffi`).
+releases ship (`target/ffi`). `make build-wasm` builds the TypeScript SDK's
+WebAssembly module; it needs the `wasm32-unknown-unknown` Rust target and
+`wasm-bindgen-cli` at the version in `Cargo.lock`, and uses `wasm-opt`
+(binaryen) when installed.
 
 To release, run `make bump-version V=X.Y.Z`, merge it to `main`, then tag:
 `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow runs CI,
 builds and tests the FFI library on every platform, attaches the archives
-and checksums to a GitHub release, publishes the pure-Python package to PyPI
-and tags the Go module as `go/vX.Y.Z`.
+and checksums to a GitHub release, publishes the pure-Python package to PyPI,
+stages the TypeScript package on npm, and tags the Go module as `go/vX.Y.Z`.
+Approve the staged npm version (with 2FA) to publish it:
+`npm stage list sqlscope-rs`, then `npm stage approve <stage-id>`, or the
+package's "Staged Packages" tab on npmjs.com.
 
 ## License
 
