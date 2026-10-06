@@ -1,0 +1,53 @@
+{
+  "name": "sqlscope-rs",
+  "version": "0.3.0",
+  "description": "Scope-aware SQL analysis and rewriting: row filters, CTE injection, table rewrites, column lineage.",
+  "keywords": [
+    "sql",
+    "lineage",
+    "row-level-security",
+    "parser",
+    "wasm"
+  ],
+  "license": "MIT",
+  "author": "dcalsky <dcalsky@gmail.com>",
+  "homepage": "https://github.com/dcalsky/sqlscope",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dcalsky/sqlscope.git",
+    "directory": "typescript"
+  },
+  "bugs": "https://github.com/dcalsky/sqlscope/issues",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "node": "./dist/node.js",
+      "default": "./dist/index.js"
+    },
+    "./sqlscope.wasm": "./wasm/sqlscope_wasm_bg.wasm",
+    "./package.json": "./package.json"
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "wasm/sqlscope_wasm.js",
+    "wasm/sqlscope_wasm.d.ts",
+    "wasm/sqlscope_wasm_bg.wasm",
+    "wasm/sqlscope_wasm_bg.wasm.d.ts"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build:wasm": "make -C .. build-wasm",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/*.test.ts\"",
+    "prepack": "node -e \"require('fs').accessSync('wasm/sqlscope_wasm_bg.wasm')\" && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sqlscope", "crates/sqlscope-ffi"]
+members = ["crates/sqlscope", "crates/sqlscope-json", "crates/sqlscope-ffi", "crates/sqlscope-wasm"]
 
 [workspace.package]
 version = "0.3.0"

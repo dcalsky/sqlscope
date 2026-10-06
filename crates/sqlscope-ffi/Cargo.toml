@@ -13,6 +13,5 @@ name = "sqlscope_ffi"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-sqlscope = { path = "../sqlscope" }
-serde.workspace = true
+sqlscope-json = { path = "../sqlscope-json" }
 serde_json.workspace = true

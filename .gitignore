@@ -8,3 +8,5 @@ dist/
 *.egg-info/
 *.dylib
 *.dll
+node_modules/
+typescript/wasm/
