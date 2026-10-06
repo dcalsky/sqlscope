@@ -12,10 +12,23 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	if err := sqlscope.Init(); err != nil {
+	if err := sqlscope.Load(""); err != nil {
 		panic(err)
 	}
 	m.Run()
+}
+
+func TestLibrary(t *testing.T) {
+	version, err := sqlscope.LibraryVersion()
+	if err != nil || version == "" {
+		t.Fatalf("LibraryVersion: %q %v", version, err)
+	}
+	if err := sqlscope.Load(""); err != nil {
+		t.Fatalf("reloading the default library: %v", err)
+	}
+	if err := sqlscope.Load("/nonexistent/" + sqlscope.LibraryFileName()); err == nil {
+		t.Fatal("want an error loading a second library")
+	}
 }
 
 func TestApplyRowFilter(t *testing.T) {
@@ -270,8 +283,8 @@ func TestErrors(t *testing.T) {
 	}
 }
 
-// The WebAssembly engine accepts the same nesting as native builds and
-// rejects deeper input cleanly instead of trapping.
+// The library accepts deep nesting on goroutine-driven threads and rejects
+// deeper input cleanly instead of overflowing the stack.
 func TestDepthLimits(t *testing.T) {
 	nested := func(depth int) string {
 		sql := "SELECT a FROM t"
@@ -309,7 +322,7 @@ func TestDepthLimits(t *testing.T) {
 			t.Fatalf("want ErrUnsupported, got %v", err)
 		}
 	}
-	// The engine stays usable after rejecting input.
+	// The library stays usable after rejecting input.
 	if _, err := sqlscope.ReferencedColumns("SELECT a FROM t"); err != nil {
 		t.Fatal(err)
 	}

@@ -101,5 +101,20 @@ def test_threads():
     assert sorted(results) == sorted([[f"a{i}"] for i in range(8)])
 
 
-def test_version():
+def test_library():
     assert sqlscope.__version__
+    assert sqlscope.library_version()
+    sqlscope.load()  # already loaded: no-op
+    with pytest.raises(sqlscope.LibraryNotFoundError):
+        sqlscope.load("/nonexistent/" + sqlscope.library_file_name())
+
+
+def test_deep_nesting_in_threads():
+    sql = "SELECT a FROM t"
+    for i in range(120):
+        sql = f"SELECT a FROM ({sql}) x{i}"
+    results = []
+    thread = threading.Thread(target=lambda: results.append(sqlscope.column_origins(sql)))
+    thread.start()
+    thread.join()
+    assert results == [{"t": ["a"]}]

@@ -1,6 +1,6 @@
 [build-system]
-requires = ["maturin>=1.8,<2"]
-build-backend = "maturin"
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
 
 [project]
 name = "sqlscope-rs"
@@ -12,7 +12,6 @@ dynamic = ["version"]
 keywords = ["sql", "lineage", "row-level-security", "parser"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Rust",
     "Topic :: Database",
     "Typing :: Typed",
 ]
@@ -20,13 +19,15 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/dcalsky/sqlscope"
 
-[tool.maturin]
-python-source = "python"
-module-name = "sqlscope._native"
-features = ["pyo3/extension-module"]
+[tool.hatch.version]
+path = "src/sqlscope/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlscope"]
 
 [dependency-groups]
 dev = ["pytest>=8", "mypy>=1.10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]

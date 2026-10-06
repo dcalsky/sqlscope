@@ -36,14 +36,31 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --exclude sqlscope-python
+        run: cargo clippy --workspace --all-targets
       - name: Test
-        run: cargo test --workspace --exclude sqlscope-python
+        run: cargo test --workspace
       - name: Docs
         if: runner.os == 'Linux'
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps -p sqlscope
+      # The SDK jobs below test against this build of the FFI library.
+      - name: Build FFI library
+        shell: bash
+        run: |
+          cargo build -p sqlscope-ffi
+          mkdir ffi
+          cp target/debug/libsqlscope_ffi.{so,dylib} target/debug/sqlscope_ffi.dll ffi/ 2>/dev/null || true
+          ls ffi
+      - name: C smoke test
+        if: runner.os != 'Windows'
+        run: |
+          cc -I crates/sqlscope-ffi/include crates/sqlscope-ffi/tests/c/smoke.c -L ffi -lsqlscope_ffi -o smoke
+          LD_LIBRARY_PATH=ffi DYLD_LIBRARY_PATH=ffi ./smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffi-${{ matrix.os }}
+          path: ffi
 
   msrv:
     name: Rust MSRV
@@ -57,53 +74,11 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked -p sqlscope -p sqlscope-wasm
-
-  wasm:
-    name: WebAssembly engine
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip1
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        env:
-          RUSTFLAGS: ""
-        run: |
-          cp go/internal/wasm/sqlscope.wasm.gz /tmp/committed.wasm.gz
-          scripts/build-wasm.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sqlscope-wasm
-          path: go/internal/wasm/sqlscope.wasm.gz
-      # Builds are only reproducible on one host platform, so CI (Linux) is
-      # the single producer of the committed module: pushes to main commit
-      # it back when it changed. Go jobs always test the fresh build.
-      - name: Check committed engine
-        id: sync
-        run: |
-          if cmp -s <(gunzip -c /tmp/committed.wasm.gz) <(gunzip -c go/internal/wasm/sqlscope.wasm.gz); then
-            echo "stale=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "stale=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::go/internal/wasm/sqlscope.wasm.gz differs from the sources; CI updates it on main"
-          fi
-      - name: Commit updated engine
-        if: steps.sync.outputs.stale == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add go/internal/wasm/sqlscope.wasm.gz
-          git commit -m "Update embedded WebAssembly engine"
-          git push
+      - run: cargo check --locked -p sqlscope -p sqlscope-ffi
 
   go:
     name: Go (${{ matrix.os }})
-    needs: wasm
+    needs: rust
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -112,12 +87,13 @@ jobs:
     defaults:
       run:
         working-directory: go
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: sqlscope-wasm
-          path: go/internal/wasm
+          name: ffi-${{ matrix.os }}
+          path: ffi
       - uses: actions/setup-go@v5
         with:
           go-version-file: go/go.mod
@@ -126,10 +102,15 @@ jobs:
       - name: gofmt
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
-      - run: go test -race -count=1 ./...
+      - name: Test
+        run: |
+          export SQLSCOPE_LIBRARY_PATH="$(ls "$GITHUB_WORKSPACE"/ffi/*sqlscope_ffi.*)"
+          go test -race -count=1 ./...
+          CGO_ENABLED=0 go test -count=1 ./...
 
   python:
     name: Python ${{ matrix.python }} (${{ matrix.os }})
+    needs: rust
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -139,22 +120,21 @@ jobs:
     defaults:
       run:
         working-directory: python
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffi-${{ matrix.os }}
+          path: ffi
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Build and install
-        shell: bash
-        env:
-          RUSTFLAGS: ""
-        run: |
-          python -m pip install --upgrade pip maturin pytest mypy
-          maturin build --release --out dist
-          python -m pip install --no-index --find-links dist sqlscope-rs
+      - name: Install
+        run: python -m pip install --upgrade pip . pytest mypy
       - name: Test
-        run: python -m pytest -q
+        run: |
+          export SQLSCOPE_LIBRARY_PATH="$(ls "$GITHUB_WORKSPACE"/ffi/*sqlscope_ffi.*)"
+          python -m pytest -q
       - name: Type check
-        run: python -m mypy --strict python/sqlscope
+        run: python -m mypy --strict src/sqlscope
