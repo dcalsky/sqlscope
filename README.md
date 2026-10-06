@@ -235,8 +235,11 @@ WebAssembly module; it needs the `wasm32-unknown-unknown` Rust target and
 To release, run `make bump-version V=X.Y.Z`, merge it to `main`, then tag:
 `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow runs CI,
 builds and tests the FFI library on every platform, attaches the archives
-and checksums to a GitHub release, publishes the pure-Python package to PyPI
-and the TypeScript package to npm, and tags the Go module as `go/vX.Y.Z`.
+and checksums to a GitHub release, publishes the pure-Python package to PyPI,
+stages the TypeScript package on npm, and tags the Go module as `go/vX.Y.Z`.
+Approve the staged npm version (with 2FA) to publish it:
+`npm stage list sqlscope-rs`, then `npm stage approve <stage-id>`, or the
+package's "Staged Packages" tab on npmjs.com.
 
 ## License
 
