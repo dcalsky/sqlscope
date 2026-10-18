@@ -103,7 +103,7 @@ pub(crate) fn rewrite_statement<R: Replacement>(
 // Pass 1: collection
 // ---------------------------------------------------------------------------
 
-/// The CTE names visible at a point of the statement (lower-case).
+/// The CTE identifier keys visible at a point of the statement.
 #[derive(Clone, Default)]
 struct Scope {
     ctes: HashSet<String>,
@@ -142,7 +142,7 @@ impl<'a> Collector<'a> {
                 if !table.name.name.is_empty() {
                     // Only an unqualified name can denote a CTE.
                     let unqualified = table.schema.is_none() && table.catalog.is_none();
-                    let cte_reference = unqualified && scope.ctes.contains(&table.name.name.to_lowercase());
+                    let cte_reference = unqualified && scope.ctes.contains(&ident_key(&table.name));
                     self.sites.push(TableSite {
                         node,
                         table,
@@ -165,13 +165,13 @@ impl<'a> Collector<'a> {
                     let names: Vec<String> = with
                         .ctes
                         .iter()
-                        .map(|cte| cte.alias.name.to_lowercase())
+                        .map(|cte| ident_key(&cte.alias))
                         .filter(|name| !name.is_empty())
                         .collect();
                     // A non-recursive CTE cannot see itself, so a same-named
                     // reference inside its body is the physical table. WITH
                     // RECURSIVE makes every sibling visible inside the bodies.
-                    let body_scope = if with.recursive {
+                    let mut body_scope = if with.recursive {
                         scope.with(names.iter().cloned())
                     } else {
                         scope.clone()
@@ -179,6 +179,7 @@ impl<'a> Collector<'a> {
                     for cte in &with.ctes {
                         cte_bodies.push(&cte.this);
                         self.visit(&cte.this, &body_scope);
+                        body_scope.ctes.insert(ident_key(&cte.alias));
                     }
                     scope.with(names)
                 }
@@ -222,26 +223,20 @@ pub(crate) fn from_entries(select: &Select) -> Vec<&Expression> {
     entries
 }
 
-/// The lower-case relation name a FROM entry binds: its alias, or the bare
+/// The identifier key a FROM entry binds: its alias, or the bare
 /// table name.
 fn relation_name(entry: &Expression) -> Option<String> {
     let name = match entry {
-        Expression::Table(table) => table
-            .alias
-            .as_ref()
-            .filter(|alias| !alias.name.is_empty())
-            .unwrap_or(&table.name)
-            .name
-            .clone(),
-        Expression::Subquery(subquery) => subquery.alias.as_ref()?.name.clone(),
-        Expression::Alias(alias) => alias.alias.name.clone(),
-        Expression::Unnest(unnest) => unnest.alias.as_ref()?.name.clone(),
-        Expression::Lateral(lateral) => lateral.alias.clone()?,
-        Expression::Pivot(pivot) => pivot.alias.as_ref()?.name.clone(),
-        Expression::Unpivot(unpivot) => unpivot.alias.as_ref()?.name.clone(),
+        Expression::Table(table) => ident_key(table.alias.as_ref().unwrap_or(&table.name)),
+        Expression::Subquery(subquery) => ident_key(subquery.alias.as_ref()?),
+        Expression::Alias(alias) => ident_key(&alias.alias),
+        Expression::Unnest(unnest) => ident_key(unnest.alias.as_ref()?),
+        Expression::Lateral(lateral) => lateral.alias.clone()?.to_lowercase(),
+        Expression::Pivot(pivot) => ident_key(pivot.alias.as_ref()?),
+        Expression::Unpivot(unpivot) => ident_key(unpivot.alias.as_ref()?),
         _ => return None,
     };
-    (!name.is_empty()).then(|| name.to_lowercase())
+    (!name.is_empty()).then_some(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -252,8 +247,8 @@ struct Match<'a, R> {
     node: &'a Expression,
     table: &'a TableRef,
     replacement: R,
-    /// Lower-case bare table name, used for single-segment qualifiers.
-    name_lower: String,
+    /// Bare table identifier key, used for single-segment qualifiers.
+    name_key: String,
     /// `catalog\0schema\0name` with SQL folding (quoted names exact), for
     /// unaliased references. Distinct identities get distinct aliases.
     identity: Option<String>,
@@ -280,7 +275,7 @@ impl<'a, R: Replacement> Match<'a, R> {
             node,
             table,
             replacement,
-            name_lower: table.name.name.to_lowercase(),
+            name_key: ident_key(&table.name),
             identity,
             alias,
         }
@@ -406,10 +401,19 @@ struct Rebinder<'r, 'a, R> {
 struct SelectScope {
     /// Multi-segment qualifiers, inherited by nested queries.
     qualified: Bindings,
-    /// Bare table names of this SELECT's own unaliased replaced tables.
+    /// Bare qualifiers inherited from enclosing scopes or replaced here.
     bare: Bindings,
     /// Relation names bound by this SELECT's FROM/JOIN entries.
     relations: HashSet<String>,
+}
+
+impl SelectScope {
+    fn bindings(&self) -> Bindings {
+        let mut bindings = self.qualified.clone();
+        bindings.retain(|key, _| key.contains('\0'));
+        bindings.extend(self.bare.clone());
+        bindings
+    }
 }
 
 impl<'r, 'a, R: Replacement> Rebinder<'r, 'a, R> {
@@ -435,19 +439,31 @@ impl<'r, 'a, R: Replacement> Rebinder<'r, 'a, R> {
 
             let mut scope = SelectScope {
                 qualified: qualified.clone(),
-                bare: Bindings::new(),
+                bare: qualified
+                    .iter()
+                    .filter(|(key, _)| !key.contains('\0'))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
                 // Names as bound after the rewrite: a replaced entry binds its
                 // derived-table alias.
                 relations: entries
                     .iter()
                     .filter_map(
                         |entry| match self.matches.iter().find(|m| std::ptr::eq(m.node, *entry)) {
-                            Some(matched) => Some(matched.alias.name.to_lowercase()),
+                            Some(matched) => Some(ident_key(&matched.alias.ident())),
                             None => relation_name(entry),
                         },
                     )
                     .collect(),
             };
+
+            // Local relation names shadow inherited bare qualifiers, even if
+            // the local relation is not replaced.
+            for entry in &entries {
+                if let Some(name) = relation_name(entry) {
+                    scope.bare.remove(&name);
+                }
+            }
 
             let mut qualifier_counts: HashMap<String, usize> = HashMap::new();
             let mut name_counts: HashMap<&str, usize> = HashMap::new();
@@ -455,7 +471,7 @@ impl<'r, 'a, R: Replacement> Rebinder<'r, 'a, R> {
                 for key in matched.claimed_qualifiers() {
                     *qualifier_counts.entry(key).or_default() += 1;
                 }
-                *name_counts.entry(matched.name_lower.as_str()).or_default() += 1;
+                *name_counts.entry(matched.name_key.as_str()).or_default() += 1;
             }
             for matched in &own {
                 for key in matched.claimed_qualifiers() {
@@ -468,10 +484,9 @@ impl<'r, 'a, R: Replacement> Rebinder<'r, 'a, R> {
                 }
                 // A bare `table.col` already resolves when the alias keeps the
                 // bare name; several same-named tables make it ambiguous.
-                if name_counts[matched.name_lower.as_str()] == 1
-                    && matched.alias.name.to_lowercase() != matched.name_lower
+                if name_counts[matched.name_key.as_str()] == 1 && ident_key(&matched.alias.ident()) != matched.name_key
                 {
-                    scope.bare.insert(matched.name_lower.clone(), matched.alias.clone());
+                    scope.bare.insert(matched.name_key.clone(), matched.alias.clone());
                 }
             }
 
@@ -482,9 +497,9 @@ impl<'r, 'a, R: Replacement> Rebinder<'r, 'a, R> {
                 .collect();
             for child in query.children() {
                 if cte_bodies.contains(&(child as *const Expression)) {
-                    // CTE bodies are their own scopes; they only inherit qualified
-                    // bindings.
-                    self.descend(child, &scope.qualified)?;
+                    // CTE bodies can see outer queries, but not this query's
+                    // own FROM relations.
+                    self.descend(child, qualified)?;
                 } else {
                     self.clause(child, &scope)?;
                 }
@@ -515,11 +530,11 @@ impl<'r, 'a, R: Replacement> Rebinder<'r, 'a, R> {
     fn clause(&mut self, node: &'a Expression, scope: &SelectScope) -> Result<()> {
         crate::ast::with_stack(|| {
             if is_query(node) {
-                return self.query(node, &scope.qualified);
+                return self.query(node, &scope.bindings());
             }
             match node {
                 Expression::Subquery(subquery) if is_query(&subquery.this) => {
-                    return self.query(&subquery.this, &scope.qualified);
+                    return self.query(&subquery.this, &scope.bindings());
                 }
                 Expression::Star(star) => {
                     if let Some(alias) = star_qualifier(star).and_then(|parts| lookup(&parts, scope)) {

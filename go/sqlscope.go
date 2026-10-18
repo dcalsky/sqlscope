@@ -53,6 +53,7 @@ const (
 	ColumnClauseUpdateSetValue  ColumnClause = "UPDATE_SET_VALUE"
 	ColumnClauseMergeOn         ColumnClause = "MERGE_ON"
 	ColumnClauseMergeWhen       ColumnClause = "MERGE_WHEN"
+	ColumnClauseReturning       ColumnClause = "RETURNING"
 )
 
 // ColumnUsage is one distinct use of a root table column in a clause.

@@ -84,6 +84,7 @@ impl Replacement for RowFilter {
 
 /// Parses `text` as exactly one boolean expression.
 fn parse_predicate(text: &str, dialect: Dialect) -> Result<Expression> {
+    ast::guard_input(text).map_err(|error| error.context("predicate"))?;
     let text = crate::normalize::strip_comments(text, dialect);
     let text = text.trim();
     if text.is_empty() {

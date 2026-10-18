@@ -105,7 +105,8 @@ export type Clause =
   | "UPDATE_SET_TARGET"
   | "UPDATE_SET_VALUE"
   | "MERGE_ON"
-  | "MERGE_WHEN";
+  | "MERGE_WHEN"
+  | "RETURNING";
 
 /** One distinct use of a root table column in a clause. */
 export interface ColumnUsage {

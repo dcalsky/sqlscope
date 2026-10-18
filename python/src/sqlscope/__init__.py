@@ -41,7 +41,7 @@ from ._library import (
     load,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "Clause",
@@ -137,6 +137,7 @@ class Clause(str, Enum):
     UPDATE_SET_VALUE = "UPDATE_SET_VALUE"
     MERGE_ON = "MERGE_ON"
     MERGE_WHEN = "MERGE_WHEN"
+    RETURNING = "RETURNING"
 
     def __str__(self) -> str:
         return self.value

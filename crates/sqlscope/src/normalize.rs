@@ -18,7 +18,7 @@ static JOIN_HINT: LazyLock<Regex> = LazyLock::new(|| {
 /// by the parser. They only influence the physical plan, so they are dropped
 /// from code (never from string literals, quoted identifiers or comments).
 pub(crate) fn normalize(sql: &str, dialect: Dialect) -> Cow<'_, str> {
-    if dialect == Dialect::STARROCKS && sql.contains('[') {
+    if sql.len() <= crate::ast::MAX_INPUT_BYTES && dialect == Dialect::STARROCKS && sql.contains('[') {
         Cow::Owned(map_code_segments(sql, |code| {
             JOIN_HINT.replace_all(code, "").into_owned()
         }))

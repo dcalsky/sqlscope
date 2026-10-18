@@ -118,3 +118,56 @@ def test_deep_nesting_in_threads():
     thread.start()
     thread.join()
     assert results == [{"t": ["a"]}]
+
+
+@pytest.mark.parametrize("query", [
+    "WITH a AS (SELECT id FROM orders), b AS (SELECT id FROM a) SELECT * FROM b ORDER BY id",
+    "SELECT orders.id FROM orders WHERE EXISTS (SELECT 1 FROM payments WHERE payments.id = orders.id) ORDER BY orders.id",
+    "SELECT o.id, p.id FROM orders o LEFT JOIN payments p ON o.id = p.id ORDER BY o.id",
+    "SELECT id FROM orders UNION SELECT id FROM payments ORDER BY id",
+])
+def test_row_filter_preserves_sqlite_query_results(query):
+    # SQLite executes both sides independently of sqlscope's parser. The
+    # reference database contains only the rows visible to tenant 7.
+    import sqlite3
+
+    raw = sqlite3.connect(":memory:")
+    visible = sqlite3.connect(":memory:")
+    try:
+        for connection in (raw, visible):
+            connection.executescript("CREATE TABLE orders(id, tenant); CREATE TABLE payments(id, tenant);")
+        orders = [(1, 7), (2, 8), (3, 7)]
+        payments = [(1, 7), (2, 7), (3, 8)]
+        for table, rows in (("orders", orders), ("payments", payments)):
+            raw.executemany(f"INSERT INTO {table} VALUES (?, ?)", rows)
+            visible.executemany(f"INSERT INTO {table} VALUES (?, ?)", [row for row in rows if row[1] == 7])
+        rewritten = sqlscope.apply_row_filter(query, "tenant = 7", dialect="sqlite")
+        assert raw.execute(rewritten).fetchall() == visible.execute(query).fetchall()
+    finally:
+        raw.close()
+        visible.close()
+
+
+def test_rewritten_correlated_query_executes_in_sqlite():
+    import sqlite3
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(
+            "ATTACH ':memory:' AS s; CREATE TABLE s.t(id); CREATE TABLE safe(id); CREATE TABLE u(id);"
+            "INSERT INTO safe VALUES (1), (2); INSERT INTO u VALUES (2);"
+        )
+        rewritten = sqlscope.rewrite_tables(
+            "SELECT t.id FROM s.t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
+            [TableRewrite("s.t", union=UnionRewrite("renamed", ["id"], [TableRef("safe")]))],
+            dialect="sqlite",
+        )
+        assert connection.execute(rewritten).fetchall() == [(2,)]
+    finally:
+        connection.close()
+
+
+def test_returning_usage():
+    assert ColumnUsage("t", "payload", Clause.RETURNING) in sqlscope.column_usages(
+        "DELETE FROM t WHERE id = 1 RETURNING payload", dialect="postgres"
+    )

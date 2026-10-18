@@ -115,6 +115,41 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
     // Inspect without the schema first: explicit names need none, and user
     // aliases such as `_col_0` must stay as written.
     let output = ast::with_large_stack(|| native_output_columns(query, Some(dialect.polyglot()))).map_err(failed)?;
+    // Native inspection may call a partial CTE alias list complete. Resolve
+    // top-level stars ourselves so the remaining columns are preserved.
+    if let Expression::Select(select) = query {
+        if select
+            .expressions
+            .iter()
+            .any(|item| matches!(item, Expression::Star(_)))
+        {
+            let mut resolver = Resolver::new(&options.schema, true, false);
+            let resolved = resolver.resolve_root(query);
+            let mut position = 0;
+            let mut names = Vec::new();
+            for (item, &count) in select.expressions.iter().zip(&resolved.items) {
+                let expanded = &resolved.names[position..position + count];
+                position += count;
+                if let Expression::Star(star) = item {
+                    if expanded.iter().any(|name| name == "*") {
+                        if star.table.is_none() {
+                            return Ok(vec!["*".to_owned()]);
+                        }
+                        names.push("*".to_owned());
+                        continue;
+                    }
+                }
+                for name in expanded {
+                    names.push(if name.is_empty() {
+                        format!("_col{}", names.len())
+                    } else {
+                        name.clone()
+                    });
+                }
+            }
+            return Ok(names);
+        }
+    }
     if output.ordinal_complete {
         return Ok(output
             .columns
@@ -130,8 +165,8 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
     // Wildcards expand through the scope resolver, which shares the schema
     // lookup of the other operations and knows the columns of CTEs, derived
     // tables and star modifiers (EXCEPT, RENAME).
-    // The resolver combines set-operation branches by position, so queries
-    // that combine them by name are left to the engine.
+    // For root set operations with unresolved wildcards, let the engine
+    // handle dialect-specific output-shape rules.
     if matches_by_name(query) {
         return schema_output(query, options);
     }

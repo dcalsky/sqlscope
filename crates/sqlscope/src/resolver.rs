@@ -12,15 +12,16 @@
 //! count.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use polyglot_sql::expressions::{
-    Column, Delete, Identifier, JoinKind, Literal, Merge, Ordered, Select, Star, Subquery, TableRef, Update, With,
+    Column, Delete, Identifier, Insert, JoinKind, Literal, Merge, Ordered, Over, Select, Star, Subquery, TableRef,
+    Update, WindowFrameBound, With,
 };
 use polyglot_sql::{Expression, ExpressionWalk};
 
-use crate::ast::{is_query, qualified_name, table_names_match};
+use crate::ast::{ident_key, is_query, qualified_name, table_names_match};
 use crate::column_usages::{Clause, ColumnUsage};
 use crate::schema::{self, Schema};
 
@@ -47,10 +48,6 @@ impl Output {
             .or_default()
             .extend(refs.iter().cloned());
         self.names.push(name);
-        self.positions.push(refs);
-    }
-
-    fn add_position(&mut self, refs: Vec<ColRef>) {
         self.positions.push(refs);
     }
 
@@ -124,6 +121,7 @@ struct Scope<'a> {
     /// FROM-position wrappers (UNNEST, PIVOT arguments, table functions)
     /// collected once every relation of the scope is known.
     deferred: RefCell<Vec<&'a Expression>>,
+    windows: RefCell<HashMap<String, &'a Over>>,
 }
 
 impl<'a> Scope<'a> {
@@ -203,14 +201,19 @@ fn apply_column_aliases(out: Rc<Output>, aliases: &[String]) -> Rc<Output> {
         return out;
     }
     let mut renamed = Output::default();
-    for (index, alias) in aliases.iter().enumerate() {
+    for index in 0..out.positions.len().max(aliases.len()) {
+        let alias = aliases
+            .get(index)
+            .or_else(|| out.names.get(index))
+            .cloned()
+            .unwrap_or_default();
         let refs = out
             .positions
             .get(index)
             .cloned()
             .or_else(|| out.names.get(index).and_then(|name| out.refs(name)).cloned())
             .unwrap_or_default();
-        renamed.add(alias.clone(), refs);
+        renamed.add(alias, refs);
     }
     Rc::new(renamed)
 }
@@ -242,12 +245,12 @@ fn dot_parts(expression: &Expression) -> Option<(String, String)> {
                 if !segments(&dot.this, out) {
                     return false;
                 }
-                out.push(dot.field.name.clone());
+                out.push(ident_key(&dot.field));
                 true
             }
             Expression::Column(column) => {
                 if let Some(table) = &column.table {
-                    out.push(table.name.clone());
+                    out.push(ident_key(table));
                 }
                 out.push(column.name.name.clone());
                 true
@@ -259,7 +262,12 @@ fn dot_parts(expression: &Expression) -> Option<(String, String)> {
     if !segments(expression, &mut parts) || parts.is_empty() {
         return None;
     }
-    let column = parts.pop()?;
+    let column = match expression {
+        Expression::Dot(dot) => dot.field.name.clone(),
+        Expression::Column(column) => column.name.name.clone(),
+        _ => return None,
+    };
+    parts.pop()?;
     Some((column, parts.join(".")))
 }
 
@@ -333,7 +341,7 @@ impl<'a, 's> Resolver<'a, 's> {
         if let Some(with) = with {
             let mut ordered = Vec::new();
             for cte in &with.ctes {
-                let name = cte.alias.name.to_lowercase();
+                let name = ident_key(&cte.alias);
                 if name.is_empty() {
                     continue;
                 }
@@ -395,30 +403,17 @@ impl<'a, 's> Resolver<'a, 's> {
     fn resolve_query(&mut self, query: &'a Expression, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
         crate::ast::with_stack(|| match query {
             Expression::Select(select) => self.resolve_select(select, parent),
-            Expression::Union(op) => self.resolve_set_op(
-                &op.left,
-                &op.right,
-                op.with.as_ref(),
-                op.order_by.as_ref(),
-                parent,
-                true,
-            ),
-            Expression::Intersect(op) => self.resolve_set_op(
-                &op.left,
-                &op.right,
-                op.with.as_ref(),
-                op.order_by.as_ref(),
-                parent,
-                false,
-            ),
-            Expression::Except(op) => self.resolve_set_op(
-                &op.left,
-                &op.right,
-                op.with.as_ref(),
-                op.order_by.as_ref(),
-                parent,
-                false,
-            ),
+            Expression::Insert(insert) => {
+                let scope = self.new_scope(insert.with.as_ref(), parent);
+                insert
+                    .query
+                    .as_ref()
+                    .map(|query| self.resolve_query(query, Some(&scope)))
+                    .unwrap_or_default()
+            }
+            Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => {
+                self.resolve_set_op(query, parent)
+            }
             _ => match as_query(query) {
                 Some(inner) => self.resolve_query(inner, parent),
                 None => Rc::default(),
@@ -429,6 +424,9 @@ impl<'a, 's> Resolver<'a, 's> {
     fn resolve_select(&mut self, select: &'a Select, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
         crate::ast::with_stack(|| {
             let scope = self.new_scope(select.with.as_ref(), parent);
+            for window in select.windows.iter().flatten() {
+                scope.windows.borrow_mut().insert(ident_key(&window.name), &window.spec);
+            }
             for entry in select.from.iter().flat_map(|from| from.expressions.iter()) {
                 self.add_source(entry, &scope);
             }
@@ -520,48 +518,98 @@ impl<'a, 's> Resolver<'a, 's> {
         })
     }
 
-    /// Merges set-operation branches positionally (names from the left).
+    /// Merges branches by position or by name, as the set operation specifies.
     /// The right branch of INTERSECT / EXCEPT only filters left values, so in
     /// flow mode its values are dropped.
-    fn resolve_set_op(
-        &mut self,
-        left: &'a Expression,
-        right: &'a Expression,
-        with: Option<&'a With>,
-        order_by: Option<&'a polyglot_sql::expressions::OrderBy>,
-        parent: Option<&Rc<Scope<'a>>>,
-        right_values_flow: bool,
-    ) -> Rc<Output> {
+    fn resolve_set_op(&mut self, query: &'a Expression, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
+        let (left, right, with, order_by, right_values_flow, by_name, corresponding, side, kind, on_columns) =
+            match query {
+                Expression::Union(op) => (
+                    &op.left,
+                    &op.right,
+                    op.with.as_ref(),
+                    op.order_by.as_ref(),
+                    true,
+                    op.by_name,
+                    op.corresponding,
+                    op.side.as_deref(),
+                    op.kind.as_deref(),
+                    &op.on_columns,
+                ),
+                Expression::Intersect(op) => (
+                    &op.left,
+                    &op.right,
+                    op.with.as_ref(),
+                    op.order_by.as_ref(),
+                    false,
+                    op.by_name,
+                    op.corresponding,
+                    op.side.as_deref(),
+                    op.kind.as_deref(),
+                    &op.on_columns,
+                ),
+                Expression::Except(op) => (
+                    &op.left,
+                    &op.right,
+                    op.with.as_ref(),
+                    op.order_by.as_ref(),
+                    false,
+                    op.by_name,
+                    op.corresponding,
+                    op.side.as_deref(),
+                    op.kind.as_deref(),
+                    &op.on_columns,
+                ),
+                _ => unreachable!("set operation"),
+            };
         let scope = self.new_scope(with, parent);
         let left = self.resolve_query(left, Some(&scope));
         let right = self.resolve_query(right, Some(&scope));
         let include_right = !self.flow_only || right_values_flow;
 
-        let mut out = Output {
-            names: left.names.clone(),
-            items: left.items.clone(),
-            ..Output::default()
-        };
-        for (index, name) in left.names.iter().enumerate() {
-            let mut refs = left.refs(name).cloned().unwrap_or_default();
-            if include_right {
-                if let Some(right_refs) = right.names.get(index).and_then(|name| right.refs(name)) {
-                    refs.extend(right_refs.iter().cloned());
+        let mut out = Output::default();
+        if by_name || corresponding || !on_columns.is_empty() {
+            let names = if !on_columns.is_empty() {
+                on_columns
+                    .iter()
+                    .filter_map(|column| match column {
+                        Expression::Column(column) => Some(column.name.name.clone()),
+                        Expression::Identifier(identifier) => Some(identifier.name.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            } else if side.is_some_and(|side| side.eq_ignore_ascii_case("RIGHT")) {
+                right.names.clone()
+            } else {
+                let mut names = left.names.clone();
+                if kind.is_some_and(|kind| kind.eq_ignore_ascii_case("INNER")) || (corresponding && side.is_none()) {
+                    names.retain(|name| right.refs(name).is_some());
+                } else if !side.is_some_and(|side| side.eq_ignore_ascii_case("LEFT")) {
+                    for name in &right.names {
+                        if !names.iter().any(|existing| existing.eq_ignore_ascii_case(name)) {
+                            names.push(name.clone());
+                        }
+                    }
                 }
+                names
+            };
+            for name in names {
+                let mut refs = left.refs(&name).cloned().unwrap_or_default();
+                if include_right {
+                    refs.extend(right.refs(&name).into_iter().flatten().cloned());
+                }
+                out.add(name, refs);
+                out.items.push(1);
             }
-            out.by_name.insert(name.to_lowercase(), refs);
-        }
-        let count = if include_right {
-            left.positions.len().max(right.positions.len())
         } else {
-            left.positions.len()
-        };
-        for index in 0..count {
-            let mut refs = left.positions.get(index).cloned().unwrap_or_default();
-            if include_right {
-                refs.extend(right.positions.get(index).into_iter().flatten().cloned());
+            out.items = left.items.clone();
+            for (index, name) in left.names.iter().enumerate() {
+                let mut refs = left.positions.get(index).cloned().unwrap_or_default();
+                if include_right {
+                    refs.extend(right.positions.get(index).into_iter().flatten().cloned());
+                }
+                out.add(name.clone(), refs);
             }
-            out.add_position(refs);
         }
         let out = Rc::new(out);
         if !self.flow_only {
@@ -601,7 +649,7 @@ impl<'a, 's> Resolver<'a, 's> {
     fn add_subquery(&mut self, subquery: &'a Subquery, scope: &Rc<Scope<'a>>) {
         let out = self.resolve_query(&subquery.this, Some(scope));
         let out = apply_column_aliases(out, &names(&subquery.column_aliases));
-        let alias = subquery.alias.as_ref().map(|alias| alias.name.to_lowercase());
+        let alias = subquery.alias.as_ref().map(ident_key);
         let roots = out.roots();
         scope.push(alias, Source::Derived { out, roots });
     }
@@ -609,7 +657,7 @@ impl<'a, 's> Resolver<'a, 's> {
     /// Registers a table reference. `extra_alias` is an alias the statement
     /// stores outside the table node (`DELETE FROM t AS x`).
     fn add_table(&mut self, table: &'a TableRef, extra_alias: Option<&Identifier>, scope: &Rc<Scope<'a>>) {
-        let name = table.name.name.to_lowercase();
+        let name = ident_key(&table.name);
         if name.is_empty() {
             return;
         }
@@ -617,7 +665,7 @@ impl<'a, 's> Resolver<'a, 's> {
             .alias
             .as_ref()
             .or(extra_alias)
-            .map(|alias| alias.name.to_lowercase())
+            .map(ident_key)
             .filter(|alias| !alias.is_empty())
             .unwrap_or_else(|| name.clone());
 
@@ -625,6 +673,7 @@ impl<'a, 's> Resolver<'a, 's> {
         if unqualified {
             if let Some(entry) = scope.ctes.get(&name).cloned() {
                 let out = self.resolve_cte(&entry);
+                let out = apply_column_aliases(out, &names(&table.column_aliases));
                 let roots = out.roots();
                 scope.push(Some(alias), Source::Derived { out, roots });
                 return;
@@ -632,7 +681,27 @@ impl<'a, 's> Resolver<'a, 's> {
         }
         let root = qualified_name(table);
         self.result.entry(root.clone()).or_default();
-        scope.push(Some(alias), Source::Physical { table: root });
+        if !table.column_aliases.is_empty() {
+            let mut out = Output::default();
+            match schema::columns(self.schema, &root) {
+                Some(columns) => {
+                    for column in columns {
+                        out.add(column.clone(), vec![(root.clone(), column.clone())]);
+                    }
+                }
+                None => {
+                    // Column positions are unknown; keep their source wildcard.
+                    for column in &table.column_aliases {
+                        out.add(column.name.clone(), vec![(root.clone(), "*".into())]);
+                    }
+                    out.add("*".into(), vec![(root.clone(), "*".into())]);
+                }
+            }
+            let out = apply_column_aliases(Rc::new(out), &names(&table.column_aliases));
+            scope.push(Some(alias), Source::Derived { out, roots: vec![root] });
+        } else {
+            scope.push(Some(alias), Source::Physical { table: root });
+        }
     }
 
     fn collect_deferred(&mut self, scope: &Rc<Scope<'a>>) {
@@ -652,7 +721,7 @@ impl<'a, 's> Resolver<'a, 's> {
             let before = out.positions.len();
             match item {
                 Expression::Star(star) => {
-                    for (name, refs) in self.expand_star(star, scope) {
+                    for (name, refs) in self.expand_star(star, scope, Clause::Select) {
                         out.add(name, refs);
                     }
                 }
@@ -673,11 +742,7 @@ impl<'a, 's> Resolver<'a, 's> {
                     // flow mode its refs still reach the caller (for example
                     // the value of a scalar subquery), under an empty name.
                     let refs = self.collect_refs(item, scope, Clause::Select);
-                    if self.flow_only {
-                        out.add(String::new(), refs);
-                    } else {
-                        out.add_position(refs);
-                    }
+                    out.add(String::new(), refs);
                 }
             }
             out.items.push(out.positions.len() - before);
@@ -688,7 +753,7 @@ impl<'a, 's> Resolver<'a, 's> {
     /// Expands `*` / `t.*` into `(name, refs)` pairs, applying the star's
     /// EXCEPT / EXCLUDE, REPLACE and RENAME modifiers. An unknown relation
     /// yields the `*` sentinel.
-    fn expand_star(&mut self, star: &'a Star, scope: &Rc<Scope<'a>>) -> Vec<(String, Vec<ColRef>)> {
+    fn expand_star(&mut self, star: &'a Star, scope: &Rc<Scope<'a>>, clause: Clause) -> Vec<(String, Vec<ColRef>)> {
         let mut columns = self.star_columns(star, scope);
         let matches = |identifier: &Identifier, name: &str| {
             if identifier.quoted {
@@ -702,15 +767,18 @@ impl<'a, 's> Resolver<'a, 's> {
         }
         let mut replaced = vec![false; columns.len()];
         for replacement in star.replace.iter().flatten() {
+            let refs = self.collect_refs(&replacement.this, scope, clause);
             if let Some(index) = columns.iter().position(|(name, _)| matches(&replacement.alias, name)) {
-                // collect_refs records the replacement's own references.
-                columns[index].1 = self.collect_refs(&replacement.this, scope, Clause::Select);
+                columns[index].1 = refs;
                 replaced[index] = true;
+            } else if columns.iter().any(|(name, _)| name == "*") {
+                columns.push((replacement.alias.name.clone(), refs));
+                replaced.push(true);
             }
         }
         for (index, (_, refs)) in columns.iter().enumerate() {
             if !replaced[index] {
-                self.add_refs(refs, Clause::Select);
+                self.add_refs(refs, clause);
             }
         }
         for (from, to) in star.rename.iter().flatten() {
@@ -724,16 +792,12 @@ impl<'a, 's> Resolver<'a, 's> {
     /// The unmodified columns a star stands for, without recording them.
     fn star_columns(&self, star: &Star, scope: &Rc<Scope<'a>>) -> Vec<(String, Vec<ColRef>)> {
         let mut out = Vec::new();
-        let qualifier = star
-            .table
-            .as_ref()
-            .map(|table| table.name.to_lowercase())
-            .unwrap_or_default();
+        let qualifier = star.table.as_ref().map(ident_key).unwrap_or_default();
 
         let emit = |source: &Source, out: &mut Vec<(String, Vec<ColRef>)>| match source {
             Source::Derived { out: derived, .. } => {
-                for name in &derived.names {
-                    let refs = derived.refs(name).cloned().unwrap_or_default();
+                for (index, name) in derived.names.iter().enumerate() {
+                    let refs = derived.positions.get(index).cloned().unwrap_or_default();
                     out.push((name.clone(), refs));
                 }
             }
@@ -879,6 +943,38 @@ impl<'a, 's> Resolver<'a, 's> {
                     for child in expression.children() {
                         refs.extend(self.collect_refs(child, scope, clause));
                     }
+                    if let Expression::WindowFunction(window) = expression {
+                        let mut name = window.over.window_name.as_ref();
+                        let mut visited = HashSet::new();
+                        while let Some(identifier) = name {
+                            let key = ident_key(identifier);
+                            if !visited.insert(key.clone()) {
+                                break;
+                            }
+                            let spec = scope.windows.borrow().get(&key).copied();
+                            let Some(spec) = spec else { break };
+                            let clause = Clause::Window;
+                            for expression in &spec.partition_by {
+                                refs.extend(self.collect_refs(expression, scope, clause));
+                            }
+                            for ordered in &spec.order_by {
+                                refs.extend(self.collect_refs(&ordered.this, scope, clause));
+                            }
+                            if let Some(frame) = &spec.frame {
+                                for bound in std::iter::once(&frame.start).chain(frame.end.iter()) {
+                                    match bound {
+                                        WindowFrameBound::Preceding(expression)
+                                        | WindowFrameBound::Following(expression)
+                                        | WindowFrameBound::Value(expression) => {
+                                            refs.extend(self.collect_refs(expression, scope, clause))
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            name = spec.window_name.as_ref();
+                        }
+                    }
                     refs
                 }
             }
@@ -896,7 +992,7 @@ impl<'a, 's> Resolver<'a, 's> {
         if name.is_empty() {
             return Vec::new();
         }
-        let qualifier = column.table.as_ref().map_or("", |table| table.name.as_str());
+        let qualifier = column.table.as_ref().map(ident_key).unwrap_or_default();
         if qualifier.is_empty() {
             if let Some(refs) = output.and_then(|output| output.refs(name)) {
                 let refs = refs.clone();
@@ -904,7 +1000,7 @@ impl<'a, 's> Resolver<'a, 's> {
                 return refs;
             }
         }
-        let refs = self.resolve(qualifier, name, scope);
+        let refs = self.resolve(&qualifier, name, scope);
         self.add_refs(&refs, clause);
         refs
     }
@@ -929,7 +1025,7 @@ impl<'a, 's> Resolver<'a, 's> {
         if qualifier.is_empty() {
             self.resolve_unqualified(name, scope)
         } else {
-            Self::resolve_qualified(&qualifier.to_lowercase(), name, scope)
+            Self::resolve_qualified(qualifier, name, scope)
         }
     }
 
@@ -1025,6 +1121,17 @@ impl<'a, 's> Resolver<'a, 's> {
     // DML
     // -----------------------------------------------------------------------
 
+    pub(crate) fn resolve_insert(&mut self, insert: &'a Insert) {
+        let scope = self.new_scope(insert.with.as_ref(), None);
+        if let Some(query) = &insert.query {
+            self.resolve_query(query, Some(&scope));
+        }
+        if !insert.returning.is_empty() {
+            self.add_table(&insert.table, insert.alias.as_ref(), &scope);
+            self.collect_returning(&insert.returning, &scope);
+        }
+    }
+
     pub(crate) fn resolve_delete(&mut self, delete: &'a Delete) {
         let scope = self.new_scope(delete.with.as_ref(), None);
         self.add_table(&delete.table, delete.alias.as_ref(), &scope);
@@ -1039,6 +1146,7 @@ impl<'a, 's> Resolver<'a, 's> {
             self.collect(&clause.this, &scope, Clause::Where, None);
         }
         self.collect_joins(&delete.joins, &scope);
+        self.collect_returning(&delete.returning, &scope);
         if let Some(order_by) = &delete.order_by {
             for item in ordered_items(&order_by.expressions) {
                 self.collect(item, &scope, Clause::OrderBy, None);
@@ -1081,6 +1189,7 @@ impl<'a, 's> Resolver<'a, 's> {
         }
         self.collect_joins(&update.table_joins, &scope);
         self.collect_joins(&update.from_joins, &scope);
+        self.collect_returning(&update.returning, &scope);
         if let Some(order_by) = &update.order_by {
             for item in ordered_items(&order_by.expressions) {
                 self.collect(item, &scope, Clause::OrderBy, None);
@@ -1107,6 +1216,17 @@ impl<'a, 's> Resolver<'a, 's> {
         }
         if let Some(whens) = &merge.whens {
             self.collect(whens, &scope, Clause::MergeWhen, None);
+        }
+    }
+
+    fn collect_returning(&mut self, expressions: &'a [Expression], scope: &Rc<Scope<'a>>) {
+        for expression in expressions {
+            match expression {
+                Expression::Star(star) => {
+                    self.expand_star(star, scope, Clause::Returning);
+                }
+                _ => self.collect(expression, scope, Clause::Returning, None),
+            }
         }
     }
 
