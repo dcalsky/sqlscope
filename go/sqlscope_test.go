@@ -364,3 +364,18 @@ func BenchmarkColumnOrigins(b *testing.B) {
 		}
 	})
 }
+
+// The Rust schema contract treats a listed table with no columns as known
+// empty. Both Go representations of an empty slice must preserve that contract.
+func TestNilSchemaColumns(t *testing.T) {
+	for _, columns := range [][]string{nil, {}} {
+		schema := map[string][]string{"t": columns}
+		got, err := sqlscope.OutputColumns("SELECT * FROM t", sqlscope.WithSchema(schema))
+		if err != nil || len(got) != 0 {
+			t.Fatalf("empty schema: got %v, error %v", got, err)
+		}
+		if !reflect.DeepEqual(schema["t"], columns) {
+			t.Fatal("WithSchema mutated the caller's map")
+		}
+	}
+}

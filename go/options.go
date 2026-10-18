@@ -24,7 +24,14 @@ func (o *options) request() map[string]any {
 		request["dialect"] = o.Dialect
 	}
 	if o.Schema != nil {
-		request["schema"] = o.Schema
+		schema := make(map[string][]string, len(o.Schema))
+		for table, columns := range o.Schema {
+			if columns == nil {
+				columns = []string{}
+			}
+			schema[table] = columns
+		}
+		request["schema"] = schema
 	}
 	if o.tableNamesSet {
 		names := o.TableNames

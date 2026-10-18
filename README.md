@@ -204,7 +204,7 @@ schema. Returns none for statements without columns.
 Every column a statement reads, anywhere, including `DELETE`/`UPDATE`/`MERGE`
 — a superset of `column_origins`. `column_usages` adds the clause
 (`SELECT`, `WHERE`, `JOIN_ON`, `GROUP_BY`, `ORDER_BY`, `UPDATE_SET_VALUE`,
-`MERGE_ON`, ...). Projection aliases and ordinals (`ORDER BY 1`) resolve to
+`MERGE_ON`, `RETURNING`, ...). Projection aliases and ordinals (`ORDER BY 1`) resolve to
 their source columns. Resolution fails open: a reference that cannot be
 attributed precisely is attributed to every candidate table, never dropped.
 

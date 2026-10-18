@@ -81,7 +81,13 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
     let slot = query_with_mut(&mut consumer).ok_or_else(|| Error::internal("query has no WITH slot"))?;
     if let Some(existing) = slot {
         for cte in &existing.ctes {
-            if let Some(name) = names.get(&ident_key(&cte.alias)) {
+            let key = ident_key(&cte.alias);
+            let conflict = names.get(&key).copied().or_else(|| {
+                ctes.iter()
+                    .map(|cte| cte.name.trim())
+                    .find(|name| ident_key(&ident(name)) == key)
+            });
+            if let Some(name) = conflict {
                 return Err(Error::invalid(format!(
                     "CTE {name:?} conflicts with existing CTE {:?}",
                     cte.alias.name

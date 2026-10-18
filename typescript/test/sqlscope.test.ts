@@ -142,3 +142,21 @@ test("require", async () => {
   const required = createRequire(import.meta.url)("sqlscope-rs") as typeof sqlscope;
   assert.deepEqual(required.outputColumns("SELECT a FROM t"), ["a"]);
 });
+
+test("scope and lineage regressions through the bundled WASM", () => {
+  const sql = "WITH a AS (SELECT id FROM orders), b AS (SELECT id FROM a) SELECT * FROM b";
+  const rewritten = sqlscope.applyRowFilter(sql, "tenant = 7");
+  assert.equal(rewritten.split("tenant = 7").length - 1, 1);
+  assert.deepEqual(sqlscope.outputColumns("SELECT * FROM t AS r(x)", {
+    dialect: "postgres", schema: { t: ["a", "b"] },
+  }), ["x", "b"]);
+  assert.deepEqual(sqlscope.columnOrigins(
+    "SELECT y FROM (SELECT a AS x, b AS y FROM t UNION ALL BY NAME SELECT c AS y, d AS x FROM u) q",
+    { dialect: "duckdb" },
+  ), { t: ["b"], u: ["c"] });
+});
+
+test("RETURNING usage", () => {
+  assert.ok(sqlscope.columnUsages("DELETE FROM t WHERE id = 1 RETURNING payload", { dialect: "postgres" })
+    .some((usage) => usage.table === "t" && usage.column === "payload" && usage.clause === "RETURNING"));
+});

@@ -238,6 +238,9 @@ pub(crate) fn inner_query(statement: &Expression) -> Option<&Expression> {
         return Some(statement);
     }
     match statement {
+        // INSERT can own a WITH clause outside its source query. Keep the
+        // wrapper so the resolver does not lose that scope.
+        Expression::Insert(insert) if insert.query.is_some() => Some(statement),
         Expression::Subquery(subquery) if is_query(&subquery.this) => Some(&subquery.this),
         Expression::Paren(paren) => inner_query(&paren.this),
         // DML statements are handled structurally; their nested queries

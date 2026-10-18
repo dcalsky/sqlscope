@@ -37,6 +37,7 @@ pub enum Clause {
     UpdateSetValue,
     MergeOn,
     MergeWhen,
+    Returning,
 }
 
 impl Clause {
@@ -62,6 +63,7 @@ impl Clause {
             Clause::UpdateSetValue => "UPDATE_SET_VALUE",
             Clause::MergeOn => "MERGE_ON",
             Clause::MergeWhen => "MERGE_WHEN",
+            Clause::Returning => "RETURNING",
         }
     }
 }
@@ -159,6 +161,7 @@ fn resolve<'a>(statement: &'a Expression, resolver: &mut Resolver<'a, '_>) {
         Expression::Delete(delete) => resolver.resolve_delete(delete),
         Expression::Update(update) => resolver.resolve_update(update),
         Expression::Merge(merge) => resolver.resolve_merge(merge),
+        Expression::Insert(insert) => resolver.resolve_insert(insert),
         _ => {
             if let Some(query) = ast::inner_query(statement) {
                 resolver.resolve_root(query);
