@@ -1009,3 +1009,42 @@ fn system_time_clauses_cannot_swallow_the_query() {
         assert!(out.contains("WHERE t = 1"), "{out}");
     }
 }
+
+#[test]
+fn negated_like_is_analyzed_and_filtered() {
+    for dialect in [Dialect::POSTGRES, Dialect::TRINO, Dialect::SNOWFLAKE, Dialect::MYSQL] {
+        let options = Options::new().dialect(dialect);
+        let sql = "SELECT * FROM a WHERE NOT a.x LIKE (SELECT p FROM secret)";
+        let out = apply_row_filter(sql, "t = 1", &options).unwrap();
+        assert_eq!(out.matches("t = 1").count(), 2, "{out}");
+        let refs = referenced_columns(sql, &options).unwrap();
+        assert_eq!(refs["secret"], ["p"]);
+        assert!(refs["a"].contains(&"x".to_string()), "{refs:?}");
+    }
+}
+
+#[test]
+fn queries_with_unparsed_syntax_are_rejected() {
+    for (dialect, sql) in [
+        (
+            Dialect::ORACLE,
+            "SELECT TO_NUMBER(x DEFAULT (SELECT max(v) FROM secret) ON CONVERSION ERROR) FROM a",
+        ),
+        (
+            Dialect::POSTGRES,
+            "SELECT * FROM a WHERE a.x <<->> (SELECT v FROM secret)",
+        ),
+    ] {
+        let options = Options::new().dialect(dialect);
+        assert_eq!(
+            apply_row_filter(sql, "t = 1", &options).unwrap_err().kind(),
+            ErrorKind::Unsupported,
+            "{sql}"
+        );
+        assert_eq!(
+            referenced_columns(sql, &options).unwrap_err().kind(),
+            ErrorKind::Unsupported,
+            "{sql}"
+        );
+    }
+}

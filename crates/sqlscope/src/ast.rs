@@ -127,7 +127,8 @@ const TABLE_READING_FUNCTIONS: &[&str] = &[
 /// table literals (`TABLE('t')`, `TABLE($t)`), relations produced by
 /// [`TABLE_READING_FUNCTIONS`] (also inside `TABLE(...)`, as in Trino's
 /// `TABLE(system.query(...))`), ClickHouse `joinGet('t', ...)`, and a bare
-/// name on the right of IN (`x IN t`), which ClickHouse reads as a table.
+/// name on the right of IN (`x IN t`), which ClickHouse reads as a table, and
+/// queries holding syntax the parser keeps as unparsed text.
 fn guard_hidden_tables(statement: &Expression) -> Result<()> {
     fn call_name(expression: &Expression) -> Option<String> {
         match expression {
@@ -161,7 +162,17 @@ fn guard_hidden_tables(statement: &Expression) -> Result<()> {
             _ => None,
         }
     }
+    let (mut query, mut raw) = (false, false);
     for node in statement.dfs() {
+        query |= matches!(
+            node,
+            Expression::Select(_)
+                | Expression::Insert(_)
+                | Expression::Update(_)
+                | Expression::Delete(_)
+                | Expression::Merge(_)
+        );
+        raw |= matches!(node, Expression::Raw(_));
         match node {
             Expression::Function(function) if function.name.eq_ignore_ascii_case("identifier") => {
                 return Err(Error::unsupported("IDENTIFIER(...) references are not supported"));
@@ -208,6 +219,15 @@ fn guard_hidden_tables(statement: &Expression) -> Result<()> {
                 "{name}(...) reads tables that cannot be scoped"
             )));
         }
+    }
+    if query && raw {
+        // The parser keeps some syntax as unparsed text (Oracle `TO_NUMBER(x
+        // DEFAULT ... ON CONVERSION ERROR)`, PostgreSQL `NOT x LIKE ALL (...)`
+        // and `<<->>`), which can hold columns and subqueries no rewrite or
+        // analysis sees.
+        return Err(Error::unsupported(
+            "syntax the parser keeps as raw text is not supported in a query",
+        ));
     }
     Ok(())
 }
@@ -582,7 +602,7 @@ pub(crate) fn parse(sql: &str, dialect: Dialect) -> Result<Vec<Expression>> {
     guard_nested_comments(sql, dialect)?;
     let statements: Vec<Expression> = parse_raw(sql, dialect)??
         .into_iter()
-        .map(fold_table_aliases)
+        .map(|statement| fold_table_aliases(statement, dialect))
         .collect::<Result<_>>()?;
     statements.iter().try_for_each(guard_hidden_tables)?;
     for statement in &statements {
@@ -603,8 +623,10 @@ pub(crate) fn parse(sql: &str, dialect: Dialect) -> Result<Vec<Expression>> {
 /// wraps some aliased FROM and JOIN tables in an alias node (Snowflake `ASOF
 /// JOIN y LIMIT MATCH_CONDITION (...)`), which become plain aliased tables,
 /// and keeps some paths as one unquoted column name (Redshift `FROM t AS c,
-/// c.arr AS o AT i`), which is split at its dots.
-fn fold_table_aliases(statement: Expression) -> Result<Expression> {
+/// c.arr AS o AT i`), which is split at its dots. It also keeps `NOT x LIKE
+/// y` as unparsed text, hiding its columns and subqueries; that text is
+/// parsed again as a negated LIKE.
+fn fold_table_aliases(statement: Expression, dialect: Dialect) -> Result<Expression> {
     fn fold(entry: &mut Expression) {
         let Expression::Alias(alias) = entry else {
             return;
@@ -629,6 +651,11 @@ fn fold_table_aliases(statement: Expression) -> Result<Expression> {
                     .flat_map(|from| from.expressions.iter_mut())
                     .chain(select.joins.iter_mut().map(|join| &mut join.this))
                     .for_each(fold),
+                Expression::Raw(raw) => {
+                    if let Some(like) = negated_like(&raw.sql, dialect) {
+                        return Ok(like);
+                    }
+                }
                 Expression::Column(column) if column.table.is_none() && !column.name.quoted => {
                     let parts: Vec<&str> = column.name.name.split('.').collect();
                     if parts.len() > 1 && parts.iter().all(|part| !part.is_empty()) {
@@ -653,6 +680,34 @@ fn fold_table_aliases(statement: Expression) -> Result<Expression> {
         })
     })
     .map_err(|error| Error::internal(format!("AST transform failed: {error}")))
+}
+
+/// `NOT ... NOT <like>` kept as text, parsed into `Not` nodes over the LIKE
+/// expression; `None` when the text is something else (it is then rejected
+/// as raw text).
+fn negated_like(sql: &str, dialect: Dialect) -> Option<Expression> {
+    let mut rest = sql.trim_start();
+    let mut negations = 0;
+    while rest.len() > 3 && rest[..3].eq_ignore_ascii_case("not") && rest[3..].starts_with(char::is_whitespace) {
+        rest = rest[3..].trim_start();
+        negations += 1;
+    }
+    if negations == 0 {
+        return None;
+    }
+    let parsed = parse_raw(&format!("SELECT 1 WHERE {rest}"), dialect).ok()?.ok()?;
+    let [Expression::Select(select)] = parsed.as_slice() else {
+        return None;
+    };
+    let condition = select.where_clause.as_ref()?.this.clone();
+    if !matches!(condition, Expression::Like(_) | Expression::ILike(_)) {
+        return None;
+    }
+    let mut expression = fold_table_aliases(condition, dialect).ok()?;
+    for _ in 0..negations {
+        expression = Expression::Not(Box::new(polyglot_sql::expressions::UnaryOp::new(expression)));
+    }
+    Some(expression)
 }
 
 /// BigQuery reads a quoted table name containing dots as a path:
