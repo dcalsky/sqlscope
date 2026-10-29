@@ -34,6 +34,13 @@ impl Dialect {
     pub(crate) fn polyglot(self) -> DialectType {
         self.0
     }
+
+    /// Whether a FROM entry may be a path through an earlier range variable
+    /// (BigQuery `FROM t, t.arr`, Redshift PartiQL `FROM t AS c, c.arr`)
+    /// rather than a table.
+    pub(crate) fn correlates_paths(self) -> bool {
+        matches!(self.0, DialectType::BigQuery | DialectType::Redshift)
+    }
 }
 
 impl Default for Dialect {

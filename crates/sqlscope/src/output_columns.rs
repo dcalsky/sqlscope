@@ -78,29 +78,37 @@ fn declared_columns(statement: &Expression, schema: &schema::Schema) -> Result<O
             }
         }
         Expression::CreateTable(table) => {
-            let mut columns = names(table.columns.iter().map(|c| c.name.name.as_str()));
-            let mut liked: Vec<String> = Vec::new();
-            let mut like_count = 0;
+            // The parser stores `(a, LIKE src, b)` as columns [a, b] plus a
+            // LIKE constraint; source positions restore the written order.
+            // Without positions, LIKE columns follow the defined ones.
+            let mut entries: Vec<(usize, Vec<String>)> = Vec::new();
+            let mut positioned = true;
+            for column in &table.columns {
+                if column.name.name.is_empty() {
+                    continue;
+                }
+                let start = column.name.span.map(|span| span.start);
+                positioned &= start.is_some();
+                entries.push((start.unwrap_or(usize::MAX), vec![column.name.name.clone()]));
+            }
+            let mut liked = false;
             for constraint in &table.constraints {
                 if let TableConstraint::Like { source, .. } = constraint {
+                    let start = source.name.span.map(|span| span.start);
+                    positioned &= start.is_some();
                     let source = qualified_name(source);
                     let source_columns = schema::columns(schema, &source)
                         .ok_or_else(|| Error::unsupported(format!("CREATE TABLE LIKE {source} requires its schema")))?;
-                    liked.extend(source_columns.iter().cloned());
-                    like_count += 1;
+                    entries.push((start.unwrap_or(usize::MAX), source_columns.to_vec()));
+                    liked = true;
                 }
             }
-            if like_count == 0 {
-                return Ok((!columns.is_empty()).then_some(columns));
+            if liked && positioned {
+                entries.sort_by_key(|(start, _)| *start); // stable for equal keys
             }
-            // The parser stores `(a, LIKE src, b)` as columns [a, b] plus one
-            // LIKE constraint; the LIKE columns belong after the first column.
-            if columns.len() >= 2 && like_count == 1 {
-                let rest = columns.split_off(1);
-                columns.extend(liked);
-                columns.extend(rest);
-            } else {
-                columns.extend(liked);
+            let columns: Vec<String> = entries.into_iter().flat_map(|(_, columns)| columns).collect();
+            if !liked && columns.is_empty() {
+                return Ok(None);
             }
             Ok(Some(columns))
         }
@@ -110,7 +118,7 @@ fn declared_columns(statement: &Expression, schema: &schema::Schema) -> Result<O
 
 fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
     let dialect = options.dialect;
-    let failed = |error: polyglot_sql::Error| Error::internal(format!("output column inspection failed: {error}"));
+    let failed = inspection_failed;
 
     // Inspect without the schema first: explicit names need none, and user
     // aliases such as `_col_0` must stay as written.
@@ -123,7 +131,7 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
             .iter()
             .any(|item| matches!(item, Expression::Star(_)))
         {
-            let mut resolver = Resolver::new(&options.schema, true, false);
+            let mut resolver = Resolver::new(options, true, false);
             let resolved = resolver.resolve_root(query);
             let mut position = 0;
             let mut names = Vec::new();
@@ -150,6 +158,14 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
             return Ok(names);
         }
     }
+    // Native inspection leaves a nested field access (`t.col.field`)
+    // unnamed; engines name it after the field, like `col.field`.
+    let projection = naming_projection(query);
+    let field_name = |index: usize| {
+        projection
+            .and_then(|items| items.get(index))
+            .and_then(field_access_name)
+    };
     if output.ordinal_complete {
         return Ok(output
             .columns
@@ -157,7 +173,7 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
             .enumerate()
             .map(|(index, column)| match column {
                 OutputColumn::Named { name, .. } => name.clone(),
-                _ => format!("_col{index}"),
+                _ => field_name(index).unwrap_or_else(|| format!("_col{index}")),
             })
             .collect());
     }
@@ -170,7 +186,7 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
     if matches_by_name(query) {
         return schema_output(query, options);
     }
-    let mut resolver = Resolver::new(&options.schema, true, false);
+    let mut resolver = Resolver::new(options, true, false);
     let resolved = resolver.resolve_root(query);
     let aligned = resolved.items.len() == output.columns.len()
         && output
@@ -184,12 +200,14 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
 
     let mut names: Vec<String> = Vec::with_capacity(resolved.names.len());
     let mut position = 0;
-    for (column, &count) in output.columns.iter().zip(&resolved.items) {
+    for (index, (column, &count)) in output.columns.iter().zip(&resolved.items).enumerate() {
         let expanded = &resolved.names[position..position + count];
         position += count;
         match column {
             OutputColumn::Named { name, .. } => names.push(name.clone()),
-            OutputColumn::Unnamed { .. } => names.push(format!("_col{}", names.len())),
+            OutputColumn::Unnamed { .. } => {
+                names.push(field_name(index).unwrap_or_else(|| format!("_col{}", names.len())))
+            }
             OutputColumn::Wildcard { qualifier, .. } => {
                 if expanded.iter().any(|name| name == "*") {
                     // Some relation's columns are unknown.
@@ -210,6 +228,27 @@ fn query_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
         }
     }
     Ok(names)
+}
+
+/// The projection that names a query's columns: its own, or that of the
+/// leftmost branch of a set operation.
+fn naming_projection(query: &Expression) -> Option<&[Expression]> {
+    match query {
+        Expression::Select(select) => Some(&select.expressions),
+        Expression::Union(op) => naming_projection(&op.left),
+        Expression::Intersect(op) => naming_projection(&op.left),
+        Expression::Except(op) => naming_projection(&op.left),
+        Expression::Subquery(subquery) => naming_projection(&subquery.this),
+        Expression::Paren(paren) => naming_projection(&paren.this),
+        _ => None,
+    }
+}
+
+fn field_access_name(item: &Expression) -> Option<String> {
+    match item {
+        Expression::Dot(dot) if !dot.field.name.is_empty() => Some(dot.field.name.clone()),
+        _ => None,
+    }
 }
 
 /// Whether a set operation in `query` matches columns by name (`UNION BY
@@ -242,7 +281,7 @@ fn matches_by_name(query: &Expression) -> bool {
 /// not line up with.
 fn schema_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
     let dialect = options.dialect;
-    let failed = |error: polyglot_sql::Error| Error::internal(format!("output column inspection failed: {error}"));
+    let failed = inspection_failed;
     let Some(validation) = schema::to_validation_schema(&options.schema) else {
         return Ok(vec!["*".to_owned()]);
     };
@@ -259,6 +298,17 @@ fn schema_output(query: &Expression, options: &Options) -> Result<Vec<String>> {
         }
     }
     Ok(names)
+}
+
+/// Classifies a failed native inspection: input the engine rejects (`UNION
+/// BY NAME` over different columns, ...) is unsupported, not a bug.
+fn inspection_failed(error: polyglot_sql::Error) -> Error {
+    match error {
+        polyglot_sql::Error::InvalidInput(_) | polyglot_sql::Error::Unsupported { .. } => {
+            Error::unsupported(format!("output column inspection failed: {error}"))
+        }
+        _ => Error::internal(format!("output column inspection failed: {error}")),
+    }
 }
 
 /// Converts the engine's `_col_{n}` to the documented `_col{n}`.

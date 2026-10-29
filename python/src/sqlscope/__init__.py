@@ -41,7 +41,7 @@ from ._library import (
     load,
 )
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "Clause",
@@ -190,7 +190,8 @@ def apply_row_filter(
     By default every physical table is filtered; ``table_names`` (bare,
     ``schema.table`` or ``catalog.schema.table``), ``table_patterns`` (regular
     expressions) and ``default_db`` restrict the scope. CTE references, table
-    functions and ``DUAL`` are never wrapped. ``predicate`` is parsed as one
+    functions and the ``DUAL`` dummy table (Oracle, the MySQL family,
+    Snowflake) are never wrapped. ``predicate`` is parsed as one
     boolean expression; bind or escape its values before calling. Returns the
     input unchanged when no table is in scope.
     """

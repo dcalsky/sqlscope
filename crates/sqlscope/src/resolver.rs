@@ -16,13 +16,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use polyglot_sql::expressions::{
-    Column, Delete, Identifier, Insert, JoinKind, Literal, Merge, Ordered, Over, Select, Star, Subquery, TableRef,
-    Update, WindowFrameBound, With,
+    Column, Delete, Identifier, Insert, Join, JoinKind, Literal, Merge, Ordered, Over, Select, Star, Subquery,
+    TableRef, Update, WindowFrameBound, With,
 };
 use polyglot_sql::{Expression, ExpressionWalk};
 
-use crate::ast::{ident_key, is_query, qualified_name, table_names_match};
+use crate::ast::{ident_key, inner_query, is_query, qualified_name, table_names_match};
 use crate::column_usages::{Clause, ColumnUsage};
+use crate::options::Options;
 use crate::schema::{self, Schema};
 
 /// A `(root table, column)` pair.
@@ -121,7 +122,13 @@ struct Scope<'a> {
     /// FROM-position wrappers (UNNEST, PIVOT arguments, table functions)
     /// collected once every relation of the scope is known.
     deferred: RefCell<Vec<&'a Expression>>,
+    /// Joins nested in FROM (`FROM (a JOIN b ON ...)`), whose conditions are
+    /// likewise collected once every relation is known.
+    deferred_joins: RefCell<Vec<&'a Join>>,
     windows: RefCell<HashMap<String, &'a Over>>,
+    /// The body scope of a derived table in FROM, which cannot see the
+    /// sibling relations of its parent scope.
+    from_derived: bool,
 }
 
 impl<'a> Scope<'a> {
@@ -174,12 +181,20 @@ impl<'a> Scope<'a> {
 
 pub(crate) struct Resolver<'a, 's> {
     schema: &'s Schema,
+    /// BigQuery: `FROM t, t.arr` reads a field of `t`, not a table.
+    correlated_paths: bool,
     flow_only: bool,
     /// Root table -> referenced columns. Every physical table that appears in
     /// a FROM is present, possibly with no columns.
     pub(crate) result: BTreeMap<String, BTreeSet<String>>,
     pub(crate) usages: Option<BTreeSet<ColumnUsage>>,
     entries: Vec<Rc<CteEntry<'a>>>,
+    /// Query and DML nodes already resolved, by address.
+    visited: HashSet<*const Expression>,
+    /// Table references already registered, by address.
+    tables: HashSet<*const TableRef>,
+    /// Set while the next scope created is a FROM derived table's body.
+    entering_derived: bool,
 }
 
 impl Drop for Resolver<'_, '_> {
@@ -282,13 +297,17 @@ fn as_query(expression: &Expression) -> Option<&Expression> {
 }
 
 impl<'a, 's> Resolver<'a, 's> {
-    pub(crate) fn new(schema: &'s Schema, flow_only: bool, track_usages: bool) -> Self {
+    pub(crate) fn new(options: &'s Options, flow_only: bool, track_usages: bool) -> Self {
         Self {
-            schema,
+            schema: &options.schema,
+            correlated_paths: options.dialect.correlates_paths(),
             flow_only,
             result: BTreeMap::new(),
             usages: track_usages.then(BTreeSet::new),
             entries: Vec::new(),
+            visited: HashSet::new(),
+            tables: HashSet::new(),
+            entering_derived: false,
         }
     }
 
@@ -370,6 +389,7 @@ impl<'a, 's> Resolver<'a, 's> {
         Rc::new(Scope {
             ctes: all,
             parent: parent.cloned(),
+            from_derived: std::mem::take(&mut self.entering_derived),
             ..Scope::default()
         })
     }
@@ -399,10 +419,105 @@ impl<'a, 's> Resolver<'a, 's> {
         self.resolve_query(query, None)
     }
 
-    /// Resolves a SELECT or set operation and returns its output mapping.
+    /// Records every reference of a statement: its query or DML structure,
+    /// then everything the structural walk did not reach.
+    pub(crate) fn resolve_statement(&mut self, statement: &'a Expression) {
+        match statement {
+            Expression::Insert(insert) => {
+                self.visited.insert(statement as *const Expression);
+                self.resolve_insert(insert, None);
+            }
+            Expression::Delete(_) | Expression::Update(_) | Expression::Merge(_) => {
+                self.resolve_query(statement, None);
+            }
+            _ => {
+                if let Some(query) = inner_query(statement) {
+                    self.resolve_root(query);
+                }
+            }
+        }
+        self.finish(statement);
+    }
+
+    /// Reference mode reports every table a statement names, so CTEs that
+    /// are never referenced and queries in positions the structural walk
+    /// does not visit (VALUES rows, table samples, ON CONFLICT, ...) are
+    /// resolved too, the latter without an enclosing scope. A table in such a
+    /// position outside any query (a table argument of a function) is
+    /// reported without columns.
+    pub(crate) fn finish(&mut self, statement: &'a Expression) {
+        if self.flow_only {
+            return;
+        }
+        self.resolve_pending_ctes();
+        // `SELECT ... INTO t`, `FOR UPDATE OF t` and `MODEL m` name no table
+        // read.
+        let mut targets: HashSet<*const Expression> = HashSet::new();
+        let mut stack = vec![statement];
+        while let Some(node) = stack.pop() {
+            let resolvable = is_query(node)
+                || matches!(
+                    node,
+                    Expression::Delete(_) | Expression::Update(_) | Expression::Merge(_) | Expression::Insert(_)
+                );
+            if resolvable && !self.visited.contains(&(node as *const Expression)) {
+                self.resolve_query(node, None);
+                self.resolve_pending_ctes();
+            }
+            if let Expression::TableArgument(argument) = node {
+                if !argument.prefix.eq_ignore_ascii_case("TABLE") {
+                    targets.insert(&argument.this as *const Expression); // MODEL m
+                }
+            }
+            if let Expression::Select(select) = node {
+                targets.extend(
+                    select
+                        .into
+                        .iter()
+                        .flat_map(|into| std::iter::once(&into.this).chain(&into.expressions))
+                        .map(|e| e as *const Expression),
+                );
+                targets.extend(
+                    select
+                        .locks
+                        .iter()
+                        .flat_map(|lock| &lock.expressions)
+                        .map(|e| e as *const Expression),
+                );
+            }
+            if let Expression::Table(table) = node {
+                let table: &TableRef = table;
+                if !self.tables.contains(&(table as *const TableRef))
+                    && !targets.contains(&(node as *const Expression))
+                    && !table.name.name.is_empty()
+                {
+                    self.result.entry(qualified_name(table)).or_default();
+                }
+            }
+            stack.extend(node.children());
+        }
+    }
+
+    fn resolve_pending_ctes(&mut self) {
+        let mut index = 0;
+        while index < self.entries.len() {
+            let entry = self.entries[index].clone();
+            if entry.memo.borrow().is_none() {
+                self.resolve_cte(&entry);
+            }
+            index += 1;
+        }
+    }
+
+    /// Resolves a SELECT or set operation and returns its output mapping. A
+    /// nested data-modifying statement outputs its RETURNING list.
     fn resolve_query(&mut self, query: &'a Expression, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
+        self.visited.insert(query as *const Expression);
         crate::ast::with_stack(|| match query {
             Expression::Select(select) => self.resolve_select(select, parent),
+            // A root INSERT wrapper resolves its source query only; one
+            // nested in a CTE is a statement of its own.
+            Expression::Insert(insert) if !self.flow_only && parent.is_some() => self.resolve_insert(insert, parent),
             Expression::Insert(insert) => {
                 let scope = self.new_scope(insert.with.as_ref(), parent);
                 insert
@@ -410,6 +525,12 @@ impl<'a, 's> Resolver<'a, 's> {
                     .as_ref()
                     .map(|query| self.resolve_query(query, Some(&scope)))
                     .unwrap_or_default()
+            }
+            Expression::Delete(delete) => self.resolve_delete(delete, parent),
+            Expression::Update(update) => self.resolve_update(update, parent),
+            Expression::Merge(merge) => {
+                self.resolve_merge(merge, parent);
+                Rc::default()
             }
             Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => {
                 self.resolve_set_op(query, parent)
@@ -504,6 +625,37 @@ impl<'a, 's> Resolver<'a, 's> {
             for view in &select.lateral_views {
                 self.collect(&view.this, &scope, Clause::LateralView, None);
             }
+            // Row selection outside the main clauses. DISTINCT ON and TOP
+            // belong to the SELECT clause; PREWHERE is an early WHERE; the
+            // row-limiting tail reports as ORDER BY, and a sample as FROM.
+            if let Some(distinct_on) = &select.distinct_on {
+                self.collect_items(distinct_on.iter(), &scope, Clause::Select, &out);
+            }
+            if let Some(top) = &select.top {
+                self.collect(&top.this, &scope, Clause::Select, None);
+            }
+            if let Some(prewhere) = &select.prewhere {
+                self.collect(prewhere, &scope, Clause::Where, None);
+            }
+            if let Some(limit_by) = &select.limit_by {
+                self.collect_items(limit_by.iter(), &scope, Clause::OrderBy, &out);
+            }
+            let limits = [
+                select.limit.as_ref().map(|limit| &limit.this),
+                select.offset.as_ref().map(|offset| &offset.this),
+                select.fetch.as_ref().and_then(|fetch| fetch.count.as_ref()),
+            ];
+            for expression in limits.into_iter().flatten() {
+                self.collect(expression, &scope, Clause::OrderBy, None);
+            }
+            if let Some(sample) = &select.sample {
+                for expression in [Some(&sample.size), sample.seed.as_ref(), sample.offset.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    self.collect(expression, &scope, Clause::From, None);
+                }
+            }
             for join in &select.joins {
                 if let Some(on) = &join.on {
                     self.collect(on, &scope, Clause::JoinOn, None);
@@ -522,6 +674,12 @@ impl<'a, 's> Resolver<'a, 's> {
     /// The right branch of INTERSECT / EXCEPT only filters left values, so in
     /// flow mode its values are dropped.
     fn resolve_set_op(&mut self, query: &'a Expression, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
+        let limits = match query {
+            Expression::Union(op) => [op.limit.as_deref(), op.offset.as_deref()],
+            Expression::Intersect(op) => [op.limit.as_deref(), op.offset.as_deref()],
+            Expression::Except(op) => [op.limit.as_deref(), op.offset.as_deref()],
+            _ => [None, None],
+        };
         let (left, right, with, order_by, right_values_flow, by_name, corresponding, side, kind, on_columns) =
             match query {
                 Expression::Union(op) => (
@@ -616,6 +774,9 @@ impl<'a, 's> Resolver<'a, 's> {
             if let Some(order_by) = order_by {
                 self.collect_items(ordered_items(&order_by.expressions), &scope, Clause::OrderBy, &out);
             }
+            for expression in limits.into_iter().flatten() {
+                self.collect(expression, &scope, Clause::OrderBy, None);
+            }
         }
         out
     }
@@ -639,24 +800,80 @@ impl<'a, 's> Resolver<'a, 's> {
                 scope.deferred.borrow_mut().extend(unpivot.columns.iter());
             }
             Expression::Paren(paren) => self.add_source(&paren.this, scope),
+            Expression::JoinedTable(joined) => {
+                self.add_source(&joined.left, scope);
+                for join in &joined.joins {
+                    self.add_source(&join.this, scope);
+                }
+                scope.deferred_joins.borrow_mut().extend(&joined.joins);
+                if !joined.lateral_views.is_empty() || joined.alias.is_some() {
+                    scope.push(joined.alias.as_ref().map(ident_key), Source::Opaque);
+                }
+            }
+            Expression::MatchRecognize(recognize) if recognize.this.is_some() => {
+                let input = recognize.this.as_deref().expect("checked above");
+                self.add_source(input, scope);
+                let clauses = entry
+                    .children()
+                    .into_iter()
+                    .filter(|child| !std::ptr::eq(*child, input));
+                scope.deferred.borrow_mut().extend(clauses);
+            }
+            // `MERGE INTO t AS x USING s AS y` wraps its relations in aliases.
+            Expression::Alias(alias) => match &alias.this {
+                Expression::Table(table) if table.alias.is_none() => self.add_table(table, Some(&alias.alias), scope),
+                Expression::Subquery(subquery) if subquery.alias.is_none() => {
+                    let column_aliases = if subquery.column_aliases.is_empty() {
+                        &alias.column_aliases
+                    } else {
+                        &subquery.column_aliases
+                    };
+                    self.add_derived(subquery, Some(&alias.alias), column_aliases, scope)
+                }
+                Expression::Table(_)
+                | Expression::Subquery(_)
+                | Expression::Pivot(_)
+                | Expression::Unpivot(_)
+                | Expression::Paren(_)
+                | Expression::MatchRecognize(_) => self.add_source(&alias.this, scope),
+                // `UNNEST(...) AS u` and the like: the alias names the relation.
+                _ => {
+                    scope.deferred.borrow_mut().push(&alias.this);
+                    scope.push(Some(ident_key(&alias.alias)), Source::Opaque);
+                }
+            },
             _ => {
                 scope.deferred.borrow_mut().push(entry);
-                scope.push(None, Source::Opaque);
+                // `UNNEST(...) AS u`, `LATERAL (...) AS l`, `f(...) AS g`: the
+                // alias names a relation, though not one of tables.
+                scope.push(crate::rewrite::relation_name(entry), Source::Opaque);
             }
         }
     }
 
     fn add_subquery(&mut self, subquery: &'a Subquery, scope: &Rc<Scope<'a>>) {
+        self.add_derived(subquery, subquery.alias.as_ref(), &subquery.column_aliases, scope);
+    }
+
+    fn add_derived(
+        &mut self,
+        subquery: &'a Subquery,
+        alias: Option<&Identifier>,
+        column_aliases: &[Identifier],
+        scope: &Rc<Scope<'a>>,
+    ) {
+        self.entering_derived = true;
         let out = self.resolve_query(&subquery.this, Some(scope));
-        let out = apply_column_aliases(out, &names(&subquery.column_aliases));
-        let alias = subquery.alias.as_ref().map(ident_key);
+        self.entering_derived = false;
+        let out = apply_column_aliases(out, &names(column_aliases));
         let roots = out.roots();
-        scope.push(alias, Source::Derived { out, roots });
+        scope.push(alias.map(ident_key), Source::Derived { out, roots });
     }
 
     /// Registers a table reference. `extra_alias` is an alias the statement
     /// stores outside the table node (`DELETE FROM t AS x`).
     fn add_table(&mut self, table: &'a TableRef, extra_alias: Option<&Identifier>, scope: &Rc<Scope<'a>>) {
+        self.tables.insert(table as *const TableRef);
         let name = ident_key(&table.name);
         if name.is_empty() {
             return;
@@ -669,6 +886,22 @@ impl<'a, 's> Resolver<'a, 's> {
             .filter(|alias| !alias.is_empty())
             .unwrap_or_else(|| name.clone());
 
+        if self.correlated_paths {
+            // `FROM t, t.arr` / `FROM t, t.s.arr`: the first part names a
+            // relation in scope, and the path reads its top-level column.
+            let path = match (&table.catalog, &table.schema) {
+                (Some(first), Some(column)) => Some((first, &column.name)),
+                (None, Some(first)) => Some((first, &table.name.name)),
+                _ => None,
+            };
+            if let Some((first, column)) = path.filter(|(first, _)| range_variable_visible(scope, &ident_key(first))) {
+                let refs = Self::resolve_qualified(&ident_key(first), column, scope);
+                self.add_refs(&refs, Clause::From);
+                // A later path may go through this one (`FROM t, t.a AS x, x.b`).
+                scope.push(Some(alias), Source::Opaque);
+                return;
+            }
+        }
         let unqualified = table.schema.is_none() && table.catalog.is_none();
         if unqualified {
             if let Some(entry) = scope.ctes.get(&name).cloned() {
@@ -708,6 +941,16 @@ impl<'a, 's> Resolver<'a, 's> {
         let deferred = std::mem::take(&mut *scope.deferred.borrow_mut());
         for expression in deferred {
             self.collect(expression, scope, Clause::From, None);
+        }
+        let joins = std::mem::take(&mut *scope.deferred_joins.borrow_mut());
+        for join in joins {
+            if let Some(on) = &join.on {
+                self.collect(on, scope, Clause::JoinOn, None);
+            }
+            for column in &join.using {
+                let refs = self.resolve_unqualified(&column.name, scope);
+                self.add_refs(&refs, Clause::JoinUsing);
+            }
         }
     }
 
@@ -1121,19 +1364,22 @@ impl<'a, 's> Resolver<'a, 's> {
     // DML
     // -----------------------------------------------------------------------
 
-    pub(crate) fn resolve_insert(&mut self, insert: &'a Insert) {
-        let scope = self.new_scope(insert.with.as_ref(), None);
-        if let Some(query) = &insert.query {
-            self.resolve_query(query, Some(&scope));
-        }
+    /// Reference mode only. Returns the output of the source query.
+    fn resolve_insert(&mut self, insert: &'a Insert, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
+        let scope = self.new_scope(insert.with.as_ref(), parent);
+        let out = match &insert.query {
+            Some(query) => self.resolve_query(query, Some(&scope)),
+            None => Rc::default(),
+        };
         if !insert.returning.is_empty() {
             self.add_table(&insert.table, insert.alias.as_ref(), &scope);
             self.collect_returning(&insert.returning, &scope);
         }
+        out
     }
 
-    pub(crate) fn resolve_delete(&mut self, delete: &'a Delete) {
-        let scope = self.new_scope(delete.with.as_ref(), None);
+    fn resolve_delete(&mut self, delete: &'a Delete, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
+        let scope = self.new_scope(delete.with.as_ref(), parent);
         self.add_table(&delete.table, delete.alias.as_ref(), &scope);
         for join in &delete.joins {
             self.add_source(&join.this, &scope);
@@ -1152,11 +1398,14 @@ impl<'a, 's> Resolver<'a, 's> {
                 self.collect(item, &scope, Clause::OrderBy, None);
             }
         }
+        self.returning_output(&delete.returning, &scope)
     }
 
-    fn update_sources(&mut self, update: &'a Update) -> Rc<Scope<'a>> {
-        let scope = self.new_scope(update.with.as_ref(), None);
-        self.add_table(&update.table, None, &scope);
+    fn update_sources(&mut self, update: &'a Update, parent: Option<&Rc<Scope<'a>>>) -> Rc<Scope<'a>> {
+        let scope = self.new_scope(update.with.as_ref(), parent);
+        if !update_target_is_alias(update) {
+            self.add_table(&update.table, None, &scope);
+        }
         for table in &update.extra_tables {
             self.add_table(table, None, &scope);
         }
@@ -1169,18 +1418,23 @@ impl<'a, 's> Resolver<'a, 's> {
         scope
     }
 
-    pub(crate) fn resolve_update(&mut self, update: &'a Update) {
-        let scope = self.update_sources(update);
+    fn resolve_update(&mut self, update: &'a Update, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
+        let scope = self.update_sources(update, parent);
         self.collect_deferred(&scope);
         let target = qualified_name(&update.table);
+        let target_alias = update_target_is_alias(update).then(|| ident_key(&update.table.name));
         for (column, value) in &update.set {
             // Some dialects store a qualified target `t.x` as one identifier.
-            match column.name.rsplit_once('.') {
-                Some((qualifier, name)) => {
+            match (column.name.rsplit_once('.'), &target_alias) {
+                (Some((qualifier, name)), _) => {
                     let refs = Self::resolve_qualified(&qualifier.to_lowercase(), name, &scope);
                     self.add_refs(&refs, Clause::UpdateSetTarget);
                 }
-                None => self.add(&target, &column.name, Clause::UpdateSetTarget),
+                (None, Some(alias)) => {
+                    let refs = Self::resolve_qualified(alias, &column.name, &scope);
+                    self.add_refs(&refs, Clause::UpdateSetTarget);
+                }
+                (None, None) => self.add(&target, &column.name, Clause::UpdateSetTarget),
             }
             self.collect(value, &scope, Clause::UpdateSetValue, None);
         }
@@ -1195,21 +1449,22 @@ impl<'a, 's> Resolver<'a, 's> {
                 self.collect(item, &scope, Clause::OrderBy, None);
             }
         }
+        self.returning_output(&update.returning, &scope)
     }
 
-    fn merge_sources(&mut self, merge: &'a Merge) -> Rc<Scope<'a>> {
+    fn merge_sources(&mut self, merge: &'a Merge, parent: Option<&Rc<Scope<'a>>>) -> Rc<Scope<'a>> {
         let with = match merge.with_.as_deref() {
             Some(Expression::With(with)) => Some(with.as_ref()),
             _ => None,
         };
-        let scope = self.new_scope(with, None);
+        let scope = self.new_scope(with, parent);
         self.add_source(&merge.this, &scope);
         self.add_source(&merge.using, &scope);
         scope
     }
 
-    pub(crate) fn resolve_merge(&mut self, merge: &'a Merge) {
-        let scope = self.merge_sources(merge);
+    fn resolve_merge(&mut self, merge: &'a Merge, parent: Option<&Rc<Scope<'a>>>) {
+        let scope = self.merge_sources(merge, parent);
         self.collect_deferred(&scope);
         if let Some(on) = &merge.on {
             self.collect(on, &scope, Clause::MergeOn, None);
@@ -1217,6 +1472,16 @@ impl<'a, 's> Resolver<'a, 's> {
         if let Some(whens) = &merge.whens {
             self.collect(whens, &scope, Clause::MergeWhen, None);
         }
+    }
+
+    /// The rows a RETURNING list outputs, computed without recording: in
+    /// reference mode [`collect_returning`](Self::collect_returning) already
+    /// recorded them under their own clause.
+    fn returning_output(&mut self, expressions: &'a [Expression], scope: &Rc<Scope<'a>>) -> Rc<Output> {
+        let flow_only = std::mem::replace(&mut self.flow_only, true);
+        let out = self.build_output(expressions, scope);
+        self.flow_only = flow_only;
+        Rc::new(out)
     }
 
     fn collect_returning(&mut self, expressions: &'a [Expression], scope: &Rc<Scope<'a>>) {
@@ -1244,7 +1509,7 @@ impl<'a, 's> Resolver<'a, 's> {
 
     /// Value flow of `UPDATE ... SET`: only assigned values count.
     pub(crate) fn update_value_flow(&mut self, update: &'a Update) {
-        let scope = self.update_sources(update);
+        let scope = self.update_sources(update, None);
         for (_, value) in &update.set {
             let refs = self.collect_refs(value, &scope, Clause::UpdateSetValue);
             self.record_flow(&refs);
@@ -1254,12 +1519,52 @@ impl<'a, 's> Resolver<'a, 's> {
     /// Value flow of `MERGE`: only values assigned by UPDATE / INSERT actions
     /// count; match conditions and target columns do not.
     pub(crate) fn merge_value_flow(&mut self, merge: &'a Merge) {
-        let scope = self.merge_sources(merge);
+        let scope = self.merge_sources(merge, None);
         for value in merge_assignment_values(merge.whens.as_deref()) {
             let refs = self.collect_refs(value, &scope, Clause::MergeWhen);
             self.record_flow(&refs);
         }
     }
+}
+
+/// T-SQL `UPDATE x SET ... FROM t AS x`: the target names a FROM relation by
+/// its alias rather than a table.
+fn update_target_is_alias(update: &Update) -> bool {
+    let target = &update.table;
+    if target.schema.is_some() || target.catalog.is_some() || target.alias.is_some() {
+        return false;
+    }
+    let name = ident_key(&target.name);
+    let alias_of = |entry: &Expression| -> Option<String> {
+        match entry {
+            Expression::Table(table) => table.alias.as_ref().map(ident_key),
+            Expression::Subquery(subquery) => subquery.alias.as_ref().map(ident_key),
+            Expression::Alias(alias) => Some(ident_key(&alias.alias)),
+            _ => None,
+        }
+    };
+    update
+        .from_clause
+        .iter()
+        .flat_map(|from| from.expressions.iter())
+        .chain(update.from_joins.iter().map(|join| &join.this))
+        .any(|entry| alias_of(entry).as_deref() == Some(name.as_str()))
+}
+
+/// Whether a relation named `key` is visible to a FROM path: an earlier entry
+/// of the same FROM, or a relation of an enclosing query. A derived table in
+/// FROM sees enclosing queries but not its siblings.
+fn range_variable_visible(scope: &Rc<Scope<'_>>, key: &str) -> bool {
+    let mut current = Some(scope.clone());
+    let mut skip = false;
+    while let Some(level) = current {
+        if !skip && level.by_alias.borrow().contains_key(key) {
+            return true;
+        }
+        skip = level.from_derived;
+        current = level.parent.clone();
+    }
+    false
 }
 
 fn ordered_items(items: &[Ordered]) -> impl Iterator<Item = &Expression> {
