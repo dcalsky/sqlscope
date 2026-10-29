@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use polyglot_sql::expressions::{Cte, With};
+use polyglot_sql::{Expression, ExpressionWalk};
 
 use crate::ast::{self, ident, ident_key, query_with_mut, MAX_INPUT_BYTES};
 use crate::error::{Error, Result};
@@ -76,8 +77,8 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
         }
     }
 
-    let mut consumer =
-        ast::parse_query(&prepare_rewrite(sql, dialect), dialect).map_err(|error| error.context("query"))?;
+    let prepared = prepare_rewrite(sql, dialect);
+    let mut consumer = ast::parse_query(&prepared, dialect).map_err(|error| error.context("query"))?;
     let slot = query_with_mut(&mut consumer).ok_or_else(|| Error::internal("query has no WITH slot"))?;
     if let Some(existing) = slot {
         for cte in &existing.ctes {
@@ -96,11 +97,36 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
         }
     }
 
+    // Under WITH RECURSIVE every definition sees every name of the clause,
+    // so a definition reading a table named like itself, a later definition
+    // or an existing CTE (`orders AS (SELECT * FROM orders ...)`) would read
+    // that CTE instead. No single WITH clause can express that.
+    let recursive = slot.as_ref().is_some_and(|with| with.recursive);
+    let existing: Vec<String> = slot
+        .iter()
+        .flat_map(|with| with.ctes.iter().map(|cte| ident_key(&cte.alias)))
+        .collect();
+
     let mut injected = Vec::with_capacity(ctes.len());
-    for cte in ctes {
+    let mut inputs: Vec<std::borrow::Cow<'_, str>> = vec![prepared.clone()];
+    for (index, cte) in ctes.iter().enumerate() {
         let name = cte.name.trim();
-        let query = ast::parse_query(&prepare_rewrite(&cte.query, dialect), dialect)
-            .map_err(|error| error.context(format!("CTE {name:?}")))?;
+        let text = prepare_rewrite(&cte.query, dialect);
+        let query = ast::parse_query(&text, dialect).map_err(|error| error.context(format!("CTE {name:?}")))?;
+        inputs.push(text);
+        if recursive {
+            let captured: Vec<String> = ctes[index..]
+                .iter()
+                .map(|cte| ident_key(&ident(cte.name.trim())))
+                .chain(existing.iter().cloned())
+                .collect();
+            if let Some(table) = unqualified_tables(&query).find(|table| captured.contains(&ident_key(table))) {
+                return Err(Error::unsupported(format!(
+                    "CTE {name:?} reads {:?}, which the query's WITH RECURSIVE would resolve to a CTE",
+                    table.name
+                )));
+            }
+        }
         injected.push(Cte {
             alias: ident(name),
             this: query,
@@ -126,7 +152,16 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
             })
         }
     }
-    ast::generate_checked(&consumer, dialect)
+    let inputs: Vec<&str> = inputs.iter().map(|input| input.as_ref()).collect();
+    ast::generate_checked(&consumer, dialect, &inputs)
+}
+
+/// The names of the unqualified table references anywhere in `query`.
+fn unqualified_tables(query: &Expression) -> impl Iterator<Item = &polyglot_sql::expressions::Identifier> {
+    query.dfs().filter_map(|node| match node {
+        Expression::Table(table) if table.schema.is_none() && table.catalog.is_none() => Some(&table.name),
+        _ => None,
+    })
 }
 
 /// Duplicate detection key: simple names compare like unquoted SQL names

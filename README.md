@@ -164,7 +164,9 @@ SELECT * FROM a  ->  SELECT * FROM (SELECT * FROM a WHERE <predicate>) AS a
 Wraps every in-scope physical table of a `SELECT` or set operation in a
 filtered derived table, which keeps the filter correct across outer joins,
 CTEs, subqueries and set operations. CTE references, table functions and
-`DUAL` are never wrapped. The predicate is parsed as one boolean expression
+the `DUAL` dummy table (Oracle, the MySQL family, Snowflake) are never
+wrapped; a query whose CTE would capture a table the
+predicate reads is rejected. The predicate is parsed as one boolean expression
 (extra clauses, statements or unbalanced parentheses are rejected); bind or
 escape its values before calling. Qualified column references
 (`schema.table.col`) are rebound onto the derived-table alias, and
@@ -224,6 +226,20 @@ Input is limited to 1 MiB and 256 levels of parser nesting on every platform.
 Rewrites regenerate SQL from the AST (normalized formatting, comments
 removed, optimizer hints kept) and verify that the output parses before
 returning it; when nothing needs rewriting, the input is returned unchanged.
+
+Every operation fails closed (`Unsupported`) on input whose tables it cannot
+see or scope: data-modifying CTEs in a rewritten query, `IDENTIFIER(...)`,
+Snowflake table literals (`TABLE('t')`), functions that read tables named by
+their arguments or by SQL text (ClickHouse `remote`/`cluster`/`merge`/`joinGet`,
+DuckDB `query_table`/`query`, Trino `TABLE(system.query(...))`, ...),
+ClickHouse `x IN t`, MySQL-family executable comments (`/*! ... */`),
+nested block comments that MySQL, BigQuery or Hive would end early, T-SQL
+table hints written without `WITH` (`t (NOLOCK)`), clause keywords the parser
+would take for a table alias (ClickHouse `a GLOBAL JOIN b`, Oracle
+`a PARTITION (p)`), and ClickHouse input the parser would silently skip.
+Rewrites also reject constructs the SQL generator would drop or cannot
+reproduce, such as Snowflake's `(+)` outer-join marker or BigQuery
+`CAST(x AS NUMERIC(10, 2))`, rather than change what the query means.
 
 ## Development
 

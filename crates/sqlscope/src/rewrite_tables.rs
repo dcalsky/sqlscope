@@ -156,13 +156,13 @@ pub fn rewrite_tables(sql: &str, rewrites: &[TableRewrite], options: &Options) -
 
     let normalized = prepare_rewrite(sql, dialect);
     let statement = ast::parse_query(&normalized, dialect)?;
-    let rewritten = rewrite_statement(statement, |table| {
+    let rewritten = rewrite_statement(statement, dialect, |table| {
         let key = match_key(table, &transparent)?;
         plan.get(&key).cloned()
     })?;
     match rewritten {
         None => Ok(sql.to_owned()),
-        Some(rewritten) => ast::generate_checked(&rewritten, dialect),
+        Some(rewritten) => ast::generate_checked(&rewritten, dialect, &[&normalized]),
     }
 }
 
@@ -220,13 +220,26 @@ fn match_key(table: &AstTable, transparent: &HashSet<String>) -> Option<String> 
 }
 
 impl Replacement for RewriteTarget {
+    fn unqualified_reads(&self) -> Vec<String> {
+        let targets = match self {
+            RewriteTarget::Inline(target) => std::slice::from_ref(target),
+            RewriteTarget::Union(union) => union.branches.as_slice(),
+        };
+        targets
+            .iter()
+            .map(TableRef::to_ast)
+            .filter(|table| table.schema.is_none())
+            .map(|table| ast::ident_key(&table.name))
+            .collect()
+    }
+
     fn default_alias(&self, table: &AstTable) -> AliasRef {
         match self {
             RewriteTarget::Union(union) => AliasRef {
                 quoted: ast::needs_quote(&union.table_alias),
                 name: union.table_alias.clone(),
             },
-            RewriteTarget::Inline(_) => AliasRef::from_ident(&table.name),
+            RewriteTarget::Inline(_) => crate::rewrite::bare_alias(table),
         }
     }
 

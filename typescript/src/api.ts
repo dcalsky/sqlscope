@@ -140,7 +140,8 @@ function run(operation: string, sql: string, fields: object, options: object): u
  * `SELECT * FROM a` becomes `SELECT * FROM (SELECT * FROM a WHERE <predicate>) AS a`.
  * By default every physical table is filtered; `tableNames`, `tablePatterns`
  * and `defaultDb` restrict the scope. CTE references, table functions and
- * `DUAL` are never wrapped. `predicate` is parsed as one boolean expression;
+ * the `DUAL` dummy table (Oracle, the MySQL family, Snowflake) are never
+ * wrapped. `predicate` is parsed as one boolean expression;
  * bind or escape its values before calling. Returns the input unchanged when
  * no table is in scope.
  */

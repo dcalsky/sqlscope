@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sqlscope", "crates/sqlscope-json", "crates/sqlscope-ffi", "crates/sqlscope-wasm"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -12,7 +12,7 @@ homepage = "https://github.com/dcalsky/sqlscope"
 authors = ["dcalsky <dcalsky@gmail.com>"]
 
 [workspace.dependencies]
-polyglot-sql = { version = "=0.13.1", default-features = false }
+polyglot-sql = { version = "=0.13.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"

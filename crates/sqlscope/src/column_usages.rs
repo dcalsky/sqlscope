@@ -123,8 +123,8 @@ impl PartialOrd for ColumnUsage {
 /// ```
 pub fn referenced_columns(sql: &str, options: &Options) -> Result<BTreeMap<String, Vec<String>>> {
     let statement = parse(sql, options)?;
-    let mut resolver = Resolver::new(&options.schema, false, false);
-    resolve(&statement, &mut resolver);
+    let mut resolver = Resolver::new(options, false, false);
+    resolver.resolve_statement(&statement);
     Ok(std::mem::take(&mut resolver.result)
         .into_iter()
         .map(|(table, columns)| (table, columns.into_iter().collect()))
@@ -147,25 +147,11 @@ pub fn referenced_columns(sql: &str, options: &Options) -> Result<BTreeMap<Strin
 /// ```
 pub fn column_usages(sql: &str, options: &Options) -> Result<Vec<ColumnUsage>> {
     let statement = parse(sql, options)?;
-    let mut resolver = Resolver::new(&options.schema, false, true);
-    resolve(&statement, &mut resolver);
+    let mut resolver = Resolver::new(options, false, true);
+    resolver.resolve_statement(&statement);
     Ok(resolver.usages.take().unwrap_or_default().into_iter().collect())
 }
 
 fn parse(sql: &str, options: &Options) -> Result<Expression> {
     ast::parse_single(&normalize(sql, options.dialect), options.dialect)
-}
-
-fn resolve<'a>(statement: &'a Expression, resolver: &mut Resolver<'a, '_>) {
-    match statement {
-        Expression::Delete(delete) => resolver.resolve_delete(delete),
-        Expression::Update(update) => resolver.resolve_update(update),
-        Expression::Merge(merge) => resolver.resolve_merge(merge),
-        Expression::Insert(insert) => resolver.resolve_insert(insert),
-        _ => {
-            if let Some(query) = ast::inner_query(statement) {
-                resolver.resolve_root(query);
-            }
-        }
-    }
 }

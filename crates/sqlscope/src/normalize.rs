@@ -7,8 +7,10 @@ use regex::Regex;
 
 use crate::options::Dialect;
 
+/// A hint directly follows its JOIN keyword; anywhere else the brackets are
+/// a subscript (`arr[shuffle]`).
 static JOIN_HINT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\[\s*(broadcast|shuffle|bucket_shuffle|colocate|replicated)\s*\]")
+    Regex::new(r"(?i)\b(join)(\s*)\[\s*(?:broadcast|shuffle|bucket_shuffle|colocate|replicated)\s*\]")
         .expect("valid join hint pattern")
 });
 
@@ -20,7 +22,7 @@ static JOIN_HINT: LazyLock<Regex> = LazyLock::new(|| {
 pub(crate) fn normalize(sql: &str, dialect: Dialect) -> Cow<'_, str> {
     if sql.len() <= crate::ast::MAX_INPUT_BYTES && dialect == Dialect::STARROCKS && sql.contains('[') {
         Cow::Owned(map_code_segments(sql, |code| {
-            JOIN_HINT.replace_all(code, "").into_owned()
+            JOIN_HINT.replace_all(code, "$1$2").into_owned()
         }))
     } else {
         Cow::Borrowed(sql)
@@ -148,6 +150,15 @@ mod tests {
         assert_eq!(
             normalize(sql, Dialect::STARROCKS),
             "select '[broadcast]', `[shuffle]` from a join  b -- [colocate]\n join  c"
+        );
+    }
+
+    #[test]
+    fn keeps_subscripts_named_like_hints() {
+        let sql = "select arr[shuffle], m[ Broadcast ] from a join[colocate] b";
+        assert_eq!(
+            normalize(sql, Dialect::STARROCKS),
+            "select arr[shuffle], m[ Broadcast ] from a join b"
         );
     }
 

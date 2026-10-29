@@ -86,7 +86,8 @@ func run[T any](operation string, fields map[string]any, opts []Option) (T, erro
 //
 // By default every physical table is filtered; WithTableNames,
 // WithTableRegexp and WithDefaultDB restrict the scope. CTE references,
-// table functions and DUAL are never wrapped. Output is regenerated
+// table functions and the DUAL dummy table (Oracle, the MySQL family,
+// Snowflake) are never wrapped. Output is regenerated
 // (normalized, comments dropped) and verified to parse. When no table is in
 // scope the input is returned unchanged.
 func ApplyRowFilter(sql, predicate string, opts ...Option) (string, error) {

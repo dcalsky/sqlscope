@@ -23,6 +23,7 @@ use polyglot_sql::{Expression, ExpressionWalk};
 
 use crate::ast::{ident_key, ident_with, is_query, query_with, Edits, NodeIds};
 use crate::error::Result;
+use crate::options::Dialect;
 
 /// An identifier name plus whether it must be quoted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,35 +49,92 @@ impl AliasRef {
 pub(crate) trait Replacement: Clone + 'static {
     /// The alias an unaliased reference prefers before collision handling.
     fn default_alias(&self, table: &TableRef) -> AliasRef {
-        AliasRef::from_ident(&table.name)
+        bare_alias(table)
+    }
+
+    /// Identifier keys of the unqualified tables the replacement itself
+    /// reads. A CTE of the query with such a name would capture the read.
+    fn unqualified_reads(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Builds the derived-table expression for `original`.
     fn build(&self, original: TableRef, alias: &AliasRef) -> Result<Expression>;
 }
 
+/// The name a table reference binds when unaliased. An Oracle database link
+/// (`emp@remote`) binds the name before the `@`.
+pub(crate) fn bare_alias(table: &TableRef) -> AliasRef {
+    let mut alias = AliasRef::from_ident(&table.name);
+    if !alias.quoted {
+        if let Some((name, _)) = alias.name.split_once('@').filter(|(name, _)| !name.is_empty()) {
+            alias.name = name.to_owned();
+        }
+    }
+    alias
+}
+
+/// The identifier keys of the unqualified table references in `expression`.
+pub(crate) fn unqualified_table_keys(expression: &Expression) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for node in expression.dfs() {
+        if let Expression::Table(table) = node {
+            if table.schema.is_none() && table.catalog.is_none() && !table.name.name.is_empty() {
+                let key = ident_key(&table.name);
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+    keys
+}
+
 /// Replaces every physical table reference for which `select` returns a
 /// replacement. Returns `None` when nothing matched.
+///
+/// In BigQuery, a FROM path whose first part names a range variable already
+/// in scope (`FROM t, t.arr`) reads a field of that relation, not a table,
+/// and is left alone.
 pub(crate) fn rewrite_statement<R: Replacement>(
     statement: Expression,
+    dialect: Dialect,
     select: impl Fn(&TableRef) -> Option<R>,
 ) -> Result<Option<Expression>> {
     let ids = NodeIds::new(&statement);
     let edits = {
-        let mut collector = Collector::default();
+        let mut collector = Collector {
+            correlated_paths: dialect.correlates_paths(),
+            ..Collector::default()
+        };
         collector.visit(&statement, &Scope::default());
 
-        let mut matches: Vec<Match<'_, R>> = collector
-            .sites
-            .iter()
-            .filter(|site| !site.cte_reference)
-            .filter_map(|site| select(site.table).map(|replacement| Match::new(site.node, site.table, replacement)))
-            .collect();
+        let mut matches: Vec<Match<'_, R>> = Vec::new();
+        for site in collector.sites.iter().filter(|site| site.physical) {
+            let bare = site.bare;
+            let Some(replacement) = select(site.table) else {
+                continue;
+            };
+            // The replacement is placed where the query's CTEs are visible;
+            // a CTE must not stand in for a table the replacement reads.
+            if let Some(name) = replacement
+                .unqualified_reads()
+                .into_iter()
+                .find(|name| site.ctes.contains(name))
+            {
+                return Err(crate::Error::unsupported(format!(
+                    "the query defines a CTE {name:?} that would replace a table the rewrite reads"
+                )));
+            }
+            let mut matched = Match::new(site.node, site.table, replacement);
+            matched.bare = bare;
+            matches.push(matched);
+        }
         if matches.is_empty() {
             return Ok(None);
         }
 
-        assign_aliases(&mut matches, &collector.occupancy);
+        assign_aliases(&mut matches, &collector.occupancy, dialect);
 
         let mut edits = Edits::default();
         let mut rebinder = Rebinder {
@@ -89,42 +147,103 @@ pub(crate) fn rewrite_statement<R: Replacement>(
         for matched in &matches {
             let replacement = matched.replacement.clone();
             let alias = matched.alias.clone();
-            edits.replace(&ids, matched.node, move |node| match node {
-                Expression::Table(table) => replacement.build(*table, &alias),
-                _ => Err(crate::Error::internal("replaced node is not a table")),
+            let bare = matched.bare;
+            edits.replace(&ids, matched.node, move |node| {
+                let table = match node {
+                    Expression::Table(table) => *table,
+                    Expression::TableArgument(argument) => match argument.this {
+                        Expression::Table(table) => *table,
+                        _ => return Err(crate::Error::internal("table argument is not a table")),
+                    },
+                    _ => return Err(crate::Error::internal("replaced node is not a table")),
+                };
+                match replacement.build(table, &alias)? {
+                    Expression::Subquery(mut subquery) if bare => {
+                        subquery.alias = None;
+                        subquery.alias_explicit_as = false;
+                        subquery.column_aliases.clear();
+                        Ok(Expression::Subquery(subquery))
+                    }
+                    built => Ok(built),
+                }
             })?;
         }
         edits
     };
-    edits.apply(statement, &ids).map(Some)
+    let rewritten = edits.apply(statement, &ids)?;
+    guard_chained_pivots(&rewritten)?;
+    Ok(Some(rewritten))
+}
+
+/// The parser reads `t PIVOT (...) UNPIVOT (...)` but not the same chain
+/// over an aliased subquery, which is what wrapping `t` produces.
+fn guard_chained_pivots(statement: &Expression) -> Result<()> {
+    fn source(expression: &Expression) -> Option<&Expression> {
+        match expression {
+            Expression::Pivot(pivot) => Some(&pivot.this),
+            Expression::Unpivot(unpivot) => Some(&unpivot.this),
+            _ => None,
+        }
+    }
+    for node in statement.dfs() {
+        let Some(inner) = source(node).filter(|inner| source(inner).is_some()) else {
+            continue;
+        };
+        let mut innermost = inner;
+        while let Some(next) = source(innermost) {
+            innermost = next;
+        }
+        if matches!(innermost, Expression::Subquery(subquery) if subquery.alias.is_some()) {
+            return Err(crate::Error::unsupported(
+                "a filtered table under chained PIVOT / UNPIVOT clauses is not supported",
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Pass 1: collection
 // ---------------------------------------------------------------------------
 
-/// The CTE identifier keys visible at a point of the statement.
+/// The CTE identifier keys, and the range variables a correlated path may
+/// name, visible at a point of the statement.
 #[derive(Clone, Default)]
 struct Scope {
     ctes: HashSet<String>,
+    relations: HashSet<String>,
 }
 
 impl Scope {
     fn with(&self, names: impl IntoIterator<Item = String>) -> Scope {
-        let mut ctes = self.ctes.clone();
-        ctes.extend(names);
-        Scope { ctes }
+        let mut scope = self.clone();
+        scope.ctes.extend(names);
+        scope
+    }
+
+    fn with_relations<'e>(&self, entries: impl IntoIterator<Item = &'e Expression>) -> Scope {
+        let mut scope = self.clone();
+        scope.relations.extend(entries.into_iter().filter_map(relation_name));
+        scope
     }
 }
 
 struct TableSite<'a> {
+    /// The table node, or the `TABLE t` argument that holds it.
     node: &'a Expression,
     table: &'a TableRef,
-    cte_reference: bool,
+    /// False for a CTE reference or a correlated path.
+    physical: bool,
+    /// The CTE names visible at the reference.
+    ctes: HashSet<String>,
+    /// The position takes no alias: a query argument (`TABLE t`) or the
+    /// input of MATCH_RECOGNIZE.
+    bare: bool,
 }
 
 #[derive(Default)]
 struct Collector<'a> {
+    correlated_paths: bool,
     sites: Vec<TableSite<'a>>,
     /// For each direct FROM/JOIN table entry: the relation names already bound
     /// in its FROM scope (visible CTEs and sibling relations).
@@ -138,23 +257,72 @@ impl<'a> Collector<'a> {
                 self.visit_query(node, scope);
                 return;
             }
-            if let Expression::Table(table) = node {
-                if !table.name.name.is_empty() {
-                    // Only an unqualified name can denote a CTE.
-                    let unqualified = table.schema.is_none() && table.catalog.is_none();
-                    let cte_reference = unqualified && scope.ctes.contains(&ident_key(&table.name));
-                    self.sites.push(TableSite {
-                        node,
-                        table,
-                        cte_reference,
-                    });
+            // DESCRIBE reads a table's metadata, not its rows.
+            if matches!(node, Expression::Describe(_)) {
+                return;
+            }
+            if let Expression::TableArgument(argument) = node {
+                // `MODEL m` names a model; `TABLE t` reads table t.
+                let Expression::Table(table) = &argument.this else {
+                    return;
+                };
+                if !argument.prefix.eq_ignore_ascii_case("TABLE") {
                     return;
                 }
+                self.record(node, table, scope, true);
+                for child in argument.this.children() {
+                    self.visit(child, scope);
+                }
+                return;
+            }
+            if let Expression::MatchRecognize(recognize) = node {
+                if let Some(Expression::Table(table)) = recognize.this.as_deref() {
+                    let input = recognize.this.as_deref().expect("checked above");
+                    self.record(input, table, scope, true);
+                    for child in node.children() {
+                        if std::ptr::eq(child, input) {
+                            child
+                                .children()
+                                .into_iter()
+                                .for_each(|clause| self.visit(clause, scope));
+                        } else {
+                            self.visit(child, scope);
+                        }
+                    }
+                    return;
+                }
+            }
+            if let Expression::Table(table) = node {
+                self.record(node, table, scope, false);
             }
             for child in node.children() {
                 self.visit(child, scope);
             }
         })
+    }
+
+    /// Records a table reference; table-level clauses (TABLESAMPLE, time
+    /// travel, hints) are visited by the caller, as they can hold subqueries.
+    fn record(&mut self, node: &'a Expression, table: &'a TableRef, scope: &Scope, bare: bool) {
+        if table.name.name.is_empty() {
+            return;
+        }
+        // Only an unqualified name can denote a CTE.
+        let unqualified = table.schema.is_none() && table.catalog.is_none();
+        let cte_reference = unqualified && scope.ctes.contains(&ident_key(&table.name));
+        let correlated = self.correlated_paths
+            && table
+                .catalog
+                .as_ref()
+                .or(table.schema.as_ref())
+                .is_some_and(|first| scope.relations.contains(&ident_key(first)));
+        self.sites.push(TableSite {
+            node,
+            table,
+            physical: !cte_reference && !correlated,
+            ctes: scope.ctes.clone(),
+            bare,
+        });
     }
 
     fn visit_query(&mut self, query: &'a Expression, scope: &Scope) {
@@ -186,12 +354,45 @@ impl<'a> Collector<'a> {
                 None => scope.clone(),
             };
 
-            if let Expression::Select(select) = query {
-                self.record_occupancy(select, &inner);
-            }
+            let Expression::Select(select) = query else {
+                for child in query.children() {
+                    if !cte_bodies.contains(&(child as *const Expression)) {
+                        self.visit(child, &inner);
+                    }
+                }
+                return;
+            };
+            self.record_occupancy(select, &inner);
+            // `SELECT ... INTO t, u` and `FOR UPDATE OF t` name targets or
+            // relations of this query, not table reads.
+            let targets: Vec<*const Expression> = select
+                .into
+                .iter()
+                .flat_map(|into| std::iter::once(&into.this).chain(&into.expressions))
+                .map(|e| e as *const Expression)
+                .chain(
+                    select
+                        .locks
+                        .iter()
+                        .flat_map(|lock| lock.expressions.iter())
+                        .map(|e| e as *const Expression),
+                )
+                .collect();
+            let entries = from_entries(select);
+            let clauses = inner.with_relations(entries.iter().copied());
             for child in query.children() {
-                if !cte_bodies.contains(&(child as *const Expression)) {
-                    self.visit(child, &inner);
+                let pointer = child as *const Expression;
+                if cte_bodies.contains(&pointer) || targets.contains(&pointer) {
+                    continue;
+                }
+                match entries.iter().position(|entry| std::ptr::eq(*entry, child)) {
+                    // A table path may correlate with the relations before it;
+                    // a derived table only with enclosing queries.
+                    Some(index) if matches!(child, Expression::Table(_)) => {
+                        self.visit(child, &inner.with_relations(entries[..index].iter().copied()))
+                    }
+                    Some(_) => self.visit(child, &inner),
+                    None => self.visit(child, &clauses),
                 }
             }
         })
@@ -225,7 +426,7 @@ pub(crate) fn from_entries(select: &Select) -> Vec<&Expression> {
 
 /// The identifier key a FROM entry binds: its alias, or the bare
 /// table name.
-fn relation_name(entry: &Expression) -> Option<String> {
+pub(crate) fn relation_name(entry: &Expression) -> Option<String> {
     let name = match entry {
         Expression::Table(table) => ident_key(table.alias.as_ref().unwrap_or(&table.name)),
         Expression::Subquery(subquery) => ident_key(subquery.alias.as_ref()?),
@@ -253,6 +454,8 @@ struct Match<'a, R> {
     /// unaliased references. Distinct identities get distinct aliases.
     identity: Option<String>,
     alias: AliasRef,
+    /// Build the derived table without an alias.
+    bare: bool,
 }
 
 impl<'a, R: Replacement> Match<'a, R> {
@@ -278,6 +481,7 @@ impl<'a, R: Replacement> Match<'a, R> {
             name_key: ident_key(&table.name),
             identity,
             alias,
+            bare: false,
         }
     }
 
@@ -300,6 +504,7 @@ impl<'a, R: Replacement> Match<'a, R> {
 fn assign_aliases<R: Replacement>(
     matches: &mut [Match<'_, R>],
     occupancy: &HashMap<*const Expression, HashSet<String>>,
+    dialect: Dialect,
 ) {
     // Distinct unaliased identities in source order, with their preferred alias.
     let mut order: Vec<String> = Vec::new();
@@ -346,11 +551,30 @@ fn assign_aliases<R: Replacement>(
         assigned.insert(identity.clone(), alias);
     }
 
+    // A name valid as a table (`hive.raw.use`) may be a keyword where an
+    // alias stands; such an alias is quoted.
+    for alias in assigned.values_mut() {
+        if !alias.quoted && !alias_parses(alias, dialect) {
+            alias.quoted = true;
+        }
+    }
+
     for matched in matches.iter_mut() {
         if let Some(identity) = &matched.identity {
             matched.alias = assigned[identity].clone();
         }
     }
+}
+
+/// Whether `alias` parses as a derived-table alias when generated for
+/// `dialect`.
+fn alias_parses(alias: &AliasRef, dialect: Dialect) -> bool {
+    let inner = Expression::Select(Box::new(select_from(vec![star()], TableRef::new("t"))));
+    let probe = Expression::Select(Box::new(select_from_entry(
+        vec![star()],
+        derived_table(inner, alias, Vec::new()),
+    )));
+    crate::ast::generate(&probe, dialect).is_ok_and(|sql| crate::ast::parse(&sql, dialect).is_ok())
 }
 
 /// A unique alias for a colliding identity: `schema_table`, then
@@ -646,10 +870,14 @@ pub(crate) fn column(name: &str) -> Expression {
 
 /// `SELECT <projection> FROM <table>`.
 pub(crate) fn select_from(projection: Vec<Expression>, table: TableRef) -> Select {
+    select_from_entry(projection, Expression::Table(Box::new(table)))
+}
+
+fn select_from_entry(projection: Vec<Expression>, entry: Expression) -> Select {
     let mut select = Select::new();
     select.expressions = projection;
     select.from = Some(polyglot_sql::expressions::From {
-        expressions: vec![Expression::Table(Box::new(table))],
+        expressions: vec![entry],
     });
     select
 }

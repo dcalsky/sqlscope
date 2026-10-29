@@ -40,7 +40,7 @@ pub fn column_origins(sql: &str, options: &Options) -> Result<BTreeMap<String, V
     let statement = ast::parse_single(&normalize(sql, dialect), dialect)?;
 
     let mut origins: BTreeMap<String, BTreeSet<String>> = match ast::inner_query(&statement) {
-        Some(query) => query_origins(query, options),
+        Some(query) => query_origins(&statement, query, options),
         None => dml_origins(&statement, options),
     };
     Ok(std::mem::take(&mut origins)
@@ -51,7 +51,7 @@ pub fn column_origins(sql: &str, options: &Options) -> Result<BTreeMap<String, V
 
 /// UPDATE and MERGE: the values assigned by SET and MERGE actions.
 fn dml_origins(statement: &Expression, options: &Options) -> BTreeMap<String, BTreeSet<String>> {
-    let mut resolver = Resolver::new(&options.schema, true, false);
+    let mut resolver = Resolver::new(options, true, false);
     match statement {
         Expression::Update(update) => resolver.update_value_flow(update),
         Expression::Merge(merge) => resolver.merge_value_flow(merge),
@@ -60,10 +60,11 @@ fn dml_origins(statement: &Expression, options: &Options) -> BTreeMap<String, BT
     std::mem::take(&mut resolver.result)
 }
 
-fn query_origins(query: &Expression, options: &Options) -> BTreeMap<String, BTreeSet<String>> {
-    // Every physical table the query reads, including filter-only ones.
-    let mut tables = Resolver::new(&options.schema, false, false);
+fn query_origins(statement: &Expression, query: &Expression, options: &Options) -> BTreeMap<String, BTreeSet<String>> {
+    // Every physical table the statement reads, including filter-only ones.
+    let mut tables = Resolver::new(options, false, false);
     tables.resolve_root(query);
+    tables.finish(statement);
     let mut origins: BTreeMap<String, BTreeSet<String>> = std::mem::take(&mut tables.result)
         .into_keys()
         .map(|table| (table, BTreeSet::new()))
@@ -71,7 +72,7 @@ fn query_origins(query: &Expression, options: &Options) -> BTreeMap<String, BTre
 
     // The refs behind each output position are exactly the values that
     // reach the result.
-    let mut flow = Resolver::new(&options.schema, true, false);
+    let mut flow = Resolver::new(options, true, false);
     let out = flow.resolve_root(query);
     for (table, column) in out.positions.iter().flatten() {
         if column.is_empty() || column == "*" {

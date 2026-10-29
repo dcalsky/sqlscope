@@ -7,9 +7,11 @@ use regex::Regex;
 
 use crate::ast::{self, opt_name};
 use crate::error::{Error, Result};
-use crate::normalize::prepare_rewrite;
+use crate::normalize::{prepare_rewrite, strip_comments};
 use crate::options::{Dialect, Options};
-use crate::rewrite::{derived_table, rewrite_statement, select_from, star, unaliased, AliasRef, Replacement};
+use crate::rewrite::{
+    derived_table, rewrite_statement, select_from, star, unaliased, unqualified_table_keys, AliasRef, Replacement,
+};
 
 /// Wraps every in-scope physical table of a query in a derived table filtered
 /// by `predicate`.
@@ -29,7 +31,12 @@ use crate::rewrite::{derived_table, rewrite_statement, select_from, star, unalia
 ///
 /// By default every physical table is filtered. [`Options::table_names`],
 /// [`Options::table_patterns`] and [`Options::default_db`] restrict the scope.
-/// CTE references, table functions and `DUAL` are never wrapped.
+/// CTE references, table functions and the `DUAL` dummy table (Oracle, the
+/// MySQL family, Snowflake) are never wrapped. Reads the
+/// rewrite cannot scope are rejected as unsupported: a data-modifying CTE, a
+/// query CTE named like a table the predicate reads, and tables named by
+/// expressions or read by functions (`IDENTIFIER(...)`, ClickHouse
+/// `remote(...)`, ...).
 ///
 /// Rewritten output is regenerated from the AST (normalized formatting, no
 /// comments) and verified to parse. When no table is in scope the input is
@@ -49,25 +56,38 @@ use crate::rewrite::{derived_table, rewrite_statement, select_from, star, unalia
 pub fn apply_row_filter(sql: &str, predicate: &str, options: &Options) -> Result<String> {
     let dialect = options.dialect;
     let scope = TableScope::compile(options)?;
+    let predicate_text = predicate;
     let predicate = parse_predicate(predicate, dialect)?;
 
     let normalized = prepare_rewrite(sql, dialect);
     let statement = ast::parse_query(&normalized, dialect)?;
     let filter = RowFilter {
+        reads: Arc::new(unqualified_table_keys(&predicate)),
         predicate: Arc::new(predicate),
     };
-    match rewrite_statement(statement, |table| scope.contains(table).then(|| filter.clone()))? {
+    match rewrite_statement(statement, dialect, |table| {
+        (!is_dummy_dual(table, dialect) && scope.contains(table)).then(|| filter.clone())
+    })? {
         None => Ok(sql.to_owned()),
-        Some(rewritten) => ast::generate_checked(&rewritten, dialect),
+        Some(rewritten) => {
+            let probe = format!("SELECT 1 WHERE {}", strip_comments(predicate_text, dialect));
+            ast::generate_checked(&rewritten, dialect, &[&normalized, &probe])
+        }
     }
 }
 
 #[derive(Clone)]
 struct RowFilter {
     predicate: Arc<Expression>,
+    /// Unqualified tables read by subqueries in the predicate.
+    reads: Arc<Vec<String>>,
 }
 
 impl Replacement for RowFilter {
+    fn unqualified_reads(&self) -> Vec<String> {
+        self.reads.as_ref().clone()
+    }
+
     fn build(&self, original: TableRef, alias: &AliasRef) -> Result<Expression> {
         let column_aliases = original.column_aliases.clone();
         let mut select = select_from(vec![star()], unaliased(original));
@@ -85,7 +105,7 @@ impl Replacement for RowFilter {
 /// Parses `text` as exactly one boolean expression.
 fn parse_predicate(text: &str, dialect: Dialect) -> Result<Expression> {
     ast::guard_input(text).map_err(|error| error.context("predicate"))?;
-    let text = crate::normalize::strip_comments(text, dialect);
+    let text = strip_comments(text, dialect);
     let text = text.trim();
     if text.is_empty() {
         return Err(Error::invalid("predicate must not be empty"));
@@ -114,10 +134,45 @@ fn parse_predicate(text: &str, dialect: Dialect) -> Result<Expression> {
     bare.where_clause = Some(Where {
         this: condition.clone(),
     });
-    if ast::generate(&statement, dialect)? != ast::generate(&Expression::Select(Box::new(bare)), dialect)? {
+    let bare = ast::generate(&Expression::Select(Box::new(bare)), dialect)?;
+    if ast::generate(&statement, dialect)? != bare {
+        return Err(invalid());
+    }
+    // A parser that skips trailing input (ClickHouse reads `t = 1 WHERE x`
+    // as `t = 1`) cannot do so inside parentheses: the text must read the
+    // same as a parenthesized expression.
+    let wrapped = ast::parse_single(&format!("SELECT 1 WHERE ({text})"), dialect).map_err(|_| invalid())?;
+    let same = match &wrapped {
+        Expression::Select(select) => match select.where_clause.as_ref().map(|w| &w.this) {
+            Some(Expression::Paren(paren)) => {
+                let mut unwrapped = Select::new();
+                unwrapped.expressions = select.expressions.clone();
+                unwrapped.where_clause = Some(Where {
+                    this: paren.this.clone(),
+                });
+                ast::generate(&Expression::Select(Box::new(unwrapped)), dialect)? == bare
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !same {
         return Err(invalid());
     }
     Ok(condition)
+}
+
+/// `DUAL`, the one-row dummy table of Oracle, the MySQL family and
+/// Snowflake. Elsewhere, and when quoted or qualified, `dual` names a table.
+fn is_dummy_dual(table: &TableRef, dialect: Dialect) -> bool {
+    use polyglot_sql::DialectType::{Doris, MySQL, Oracle, SingleStore, Snowflake, StarRocks, TiDB};
+    matches!(
+        dialect.polyglot(),
+        Oracle | MySQL | SingleStore | TiDB | StarRocks | Doris | Snowflake
+    ) && table.schema.is_none()
+        && table.catalog.is_none()
+        && !table.name.quoted
+        && table.name.name.eq_ignore_ascii_case("dual")
 }
 
 /// The set of tables `apply_row_filter` wraps.
@@ -189,9 +244,6 @@ impl TableScope {
         }
         let schema = opt_name(&table.schema).to_lowercase();
         let catalog = opt_name(&table.catalog).to_lowercase();
-        if schema.is_empty() && name == "dual" {
-            return false;
-        }
         if !self.restricted {
             return true;
         }
