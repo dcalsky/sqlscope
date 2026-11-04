@@ -40,6 +40,21 @@ def test_rewrite_tables():
     )
 
 
+def test_project_from_injected_cte():
+    query = sqlscope.rewrite_tables("SELECT t.a FROM s.t", [
+        TableRewrite("s.t", inline=TableRef("permitted"), columns=["a", "end"])
+    ])
+    query = sqlscope.inject_ctes(query, [CteDef("permitted", "SELECT * FROM src.t")])
+    assert query == 'WITH permitted AS (SELECT * FROM src.t) SELECT t.a FROM (SELECT a, "end" FROM permitted) AS t'
+
+
+def test_rename_table_argument():
+    query = sqlscope.rewrite_tables("SELECT * FROM ML.PREDICT(MODEL s.t, TABLE s.t)", [
+        TableRewrite("s.t", rename=TableRef("u", "v"))
+    ], dialect="bigquery")
+    assert query == "SELECT * FROM ML.PREDICT(MODEL s.t, TABLE v.u)"
+
+
 def test_rewrite_tables_requires_one_target():
     with pytest.raises(sqlscope.InvalidArgumentError):
         sqlscope.rewrite_tables("SELECT 1", [TableRewrite("s.t")])

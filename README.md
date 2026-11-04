@@ -7,7 +7,7 @@ Scope-aware SQL analysis and rewriting for Rust, Python, Go and TypeScript, buil
 | --- | --- |
 | `apply_row_filter` | Filter every in-scope table by a predicate (row-level security). |
 | `inject_ctes` | Prepend CTE definitions to a query's root `WITH`. |
-| `rewrite_tables` | Replace table references with derived tables. |
+| `rewrite_tables` | Replace table references with other tables or derived tables. |
 | `column_origins` | Source columns whose values reach the result (column lineage). |
 | `output_columns` | Names of the columns a statement outputs. |
 | `referenced_columns` | Columns referenced anywhere (filters included), per table. |
@@ -180,9 +180,25 @@ an existing root CTE are rejected.
 
 ### `rewrite_tables(sql, rewrites)`
 
-Replaces references to a `schema.table` match key with
-`(SELECT * FROM target)` or a `UNION DISTINCT` over several tables, keeping
-the reference's alias and rebinding qualified columns.
+Each rule matches a `schema.table` and selects one target: `inline`, `rename`,
+or `union`. An inline rule with `columns: ["a", "b"]` generates
+`(SELECT a, b FROM target) AS t`; omit the list or leave it empty for
+`SELECT *`. Supply column names as identifier values (e.g. `end`), without
+SQL quotes. A rename generates `target AS t` directly. Both modes keep an
+explicit alias or use the original table name, rebinding qualified references.
+A union rule specifies its columns inside `union`.
+
+For example, to redirect `iceberg.s.t` in Go:
+
+```go
+sqlscope.RewriteTables(sql, []sqlscope.TableRewrite{{
+    MatchKey: "s.t",
+    Rename:   &sqlscope.TableRef{Catalog: "iceberg_catalog1", Schema: "s", Table: "t"},
+}}, sqlscope.WithStripCatalogs("iceberg"))
+```
+
+This uses the existing transparent catalog matching rule: both `iceberg.s.t`
+and `s.t` match; a table qualified by another catalog does not.
 
 ### `column_origins(sql)`
 

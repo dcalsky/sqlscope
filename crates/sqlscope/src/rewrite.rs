@@ -149,10 +149,10 @@ pub(crate) fn rewrite_statement<R: Replacement>(
             let alias = matched.alias.clone();
             let bare = matched.bare;
             edits.replace(&ids, matched.node, move |node| {
-                let table = match node {
-                    Expression::Table(table) => *table,
+                let (table, argument_prefix) = match node {
+                    Expression::Table(table) => (*table, None),
                     Expression::TableArgument(argument) => match argument.this {
-                        Expression::Table(table) => *table,
+                        Expression::Table(table) => (*table, Some(argument.prefix)),
                         _ => return Err(crate::Error::internal("table argument is not a table")),
                     },
                     _ => return Err(crate::Error::internal("replaced node is not a table")),
@@ -163,6 +163,20 @@ pub(crate) fn rewrite_statement<R: Replacement>(
                         subquery.alias_explicit_as = false;
                         subquery.column_aliases.clear();
                         Ok(Expression::Subquery(subquery))
+                    }
+                    Expression::Table(mut table) if bare => {
+                        table.alias = None;
+                        table.alias_explicit_as = false;
+                        let renamed = Expression::Table(table);
+                        Ok(match argument_prefix {
+                            Some(prefix) => {
+                                Expression::TableArgument(Box::new(polyglot_sql::expressions::TableArgument {
+                                    prefix,
+                                    this: renamed,
+                                }))
+                            }
+                            None => renamed,
+                        })
                     }
                     built => Ok(built),
                 }

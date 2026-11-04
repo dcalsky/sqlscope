@@ -155,6 +155,56 @@ func TestRewriteTables(t *testing.T) {
 	}
 }
 
+func TestInlineProjection(t *testing.T) {
+	for _, tc := range []struct {
+		columns    []string
+		projection string
+	}{
+		{nil, "*"}, {[]string{}, "*"}, {[]string{"a", "b"}, "a, b"},
+		{[]string{"end", "a.b", `a"b`, "*"}, `"end", "a.b", "a""b", "*"`},
+	} {
+		got, err := sqlscope.RewriteTables("SELECT t.a FROM s.t", []sqlscope.TableRewrite{{
+			MatchKey: "s.t", Inline: &sqlscope.TableRef{Table: "x"}, Columns: tc.columns,
+		}})
+		want := "SELECT t.a FROM (SELECT " + tc.projection + " FROM x) AS t"
+		if err != nil || got != want {
+			t.Errorf("columns %q: got %q, %v; want %q", tc.columns, got, err, want)
+		}
+	}
+}
+
+func TestRenameInFilter(t *testing.T) {
+	rule := sqlscope.TableRewrite{MatchKey: "s.t", Rename: &sqlscope.TableRef{Catalog: "iceberg_catalog1", Schema: "s", Table: "t"}}
+	for _, tc := range []struct{ sql, want string }{
+		{"SELECT 1 WHERE EXISTS (SELECT iceberg.s.t.id FROM iceberg.s.t WHERE t.note = 'iceberg.s.t')",
+			"SELECT 1 WHERE EXISTS(SELECT t.id FROM iceberg_catalog1.s.t AS t WHERE t.note = 'iceberg.s.t')"},
+		{"SELECT z.a FROM iceberg.s.t AS z(a) TABLESAMPLE BERNOULLI (10)",
+			"SELECT z.a FROM iceberg_catalog1.s.t AS z(a) TABLESAMPLE BERNOULLI (10)"},
+		{"SELECT * FROM other.s.t", "SELECT * FROM other.s.t"},
+	} {
+		got, err := sqlscope.RewriteTables(tc.sql, []sqlscope.TableRewrite{rule}, sqlscope.WithStripCatalogs("iceberg"))
+		if err != nil || got != tc.want {
+			t.Errorf("got %q, %v; want %q", got, err, tc.want)
+		}
+	}
+}
+
+func TestInvalidTableRewriteOptions(t *testing.T) {
+	x := &sqlscope.TableRef{Table: "x"}
+	union := &sqlscope.UnionRewrite{TableAlias: "t", Columns: []string{"a"}, Branches: []sqlscope.TableRef{*x}}
+	for _, rule := range []sqlscope.TableRewrite{
+		{Union: union, Columns: []string{"a"}}, {Rename: x, Columns: []string{"a"}},
+		{Inline: x, Rename: x}, {Union: union, Rename: x}, {Inline: x, Union: union},
+		{Inline: x, Columns: []string{" "}}, {Rename: &sqlscope.TableRef{}},
+	} {
+		rule.MatchKey = "s.t"
+		_, err := sqlscope.RewriteTables("SELECT * FROM s.t", []sqlscope.TableRewrite{rule})
+		if !errors.Is(err, sqlscope.ErrInvalidArgument) {
+			t.Errorf("rule %+v: want invalid argument, got %v", rule, err)
+		}
+	}
+}
+
 var lineageSchema = map[string][]string{
 	"hive.raw.users":  {"user_id", "user_name", "email"},
 	"hive.raw.orders": {"order_id", "user_id", "amount", "status"},

@@ -82,6 +82,10 @@ pub struct UnionRewrite {
 pub enum RewriteTarget {
     /// `(SELECT * FROM <table>)`.
     Inline(TableRef),
+    /// An inline derived table selecting the given identifier values (empty means star).
+    InlineColumns { table: TableRef, columns: Vec<String> },
+    /// A direct table reference, preserving the binding of the original table.
+    Rename(TableRef),
     /// `(SELECT <columns> FROM <b1> UNION DISTINCT SELECT <columns> FROM <b2> ...)`.
     Union(UnionRewrite),
 }
@@ -105,6 +109,22 @@ impl TableRewrite {
         }
     }
 
+    /// Replaces `match_key` with a derived table projecting the supplied column names.
+    pub fn inline_columns(match_key: impl Into<String>, table: TableRef, columns: Vec<String>) -> Self {
+        Self {
+            match_key: match_key.into(),
+            target: RewriteTarget::InlineColumns { table, columns },
+        }
+    }
+
+    /// Changes the table name directly, keeping the alias used by the query.
+    pub fn rename(match_key: impl Into<String>, table: TableRef) -> Self {
+        Self {
+            match_key: match_key.into(),
+            target: RewriteTarget::Rename(table),
+        }
+    }
+
     /// Replaces `match_key` with a `UNION DISTINCT` derived table.
     pub fn union(match_key: impl Into<String>, union: UnionRewrite) -> Self {
         Self {
@@ -117,7 +137,7 @@ impl TableRewrite {
 /// Replaces physical table references in a query according to a plan.
 ///
 /// Every reference whose `schema.table` matches a [`TableRewrite`] becomes a
-/// derived table that keeps the reference's alias, or, when it had none, its
+/// replacement that keeps the reference's alias, or, when it had none, its
 /// bare table name (the union's [`table_alias`](UnionRewrite::table_alias)),
 /// disambiguated if two distinct tables would collide. Qualified column and
 /// star references (`schema.table.col`, `catalog.schema.table.*`) are
@@ -179,7 +199,13 @@ fn compile_plan(rewrites: &[TableRewrite]) -> Result<HashMap<String, RewriteTarg
         }
         let invalid = |message: String| Error::invalid(format!("table rewrite {raw:?}: {message}"));
         match &rewrite.target {
-            RewriteTarget::Inline(target) => target.validate().map_err(invalid)?,
+            RewriteTarget::InlineColumns { table, columns } => {
+                table.validate().map_err(invalid)?;
+                if let Some(index) = columns.iter().position(|c| c.trim().is_empty()) {
+                    return Err(invalid(format!("inline column {index} must not be empty")));
+                }
+            }
+            RewriteTarget::Inline(target) | RewriteTarget::Rename(target) => target.validate().map_err(invalid)?,
             RewriteTarget::Union(union) => {
                 if union.table_alias.trim().is_empty() {
                     return Err(invalid("union rewrite requires a table alias".into()));
@@ -222,7 +248,9 @@ fn match_key(table: &AstTable, transparent: &HashSet<String>) -> Option<String> 
 impl Replacement for RewriteTarget {
     fn unqualified_reads(&self) -> Vec<String> {
         let targets = match self {
-            RewriteTarget::Inline(target) => std::slice::from_ref(target),
+            RewriteTarget::Inline(target)
+            | RewriteTarget::InlineColumns { table: target, .. }
+            | RewriteTarget::Rename(target) => std::slice::from_ref(target),
             RewriteTarget::Union(union) => union.branches.as_slice(),
         };
         targets
@@ -239,19 +267,34 @@ impl Replacement for RewriteTarget {
                 quoted: ast::needs_quote(&union.table_alias),
                 name: union.table_alias.clone(),
             },
-            RewriteTarget::Inline(_) => crate::rewrite::bare_alias(table),
+            RewriteTarget::Inline(_) | RewriteTarget::InlineColumns { .. } | RewriteTarget::Rename(_) => {
+                crate::rewrite::bare_alias(table)
+            }
         }
     }
 
-    fn build(&self, original: AstTable, alias: &AliasRef) -> Result<Expression> {
-        let sample = original.table_sample;
+    fn build(&self, mut original: AstTable, alias: &AliasRef) -> Result<Expression> {
+        let sample = &original.table_sample;
         let with_sample = |target: &TableRef| {
             let mut table = target.to_ast();
             table.table_sample = sample.clone();
             table
         };
         let query = match self {
-            RewriteTarget::Inline(target) => {
+            RewriteTarget::Rename(target) => {
+                let new = target.to_ast();
+                original.name = new.name;
+                original.schema = new.schema;
+                original.catalog = new.catalog;
+                original.alias = Some(alias.ident());
+                original.alias_explicit_as = true;
+                return Ok(Expression::Table(Box::new(original)));
+            }
+            RewriteTarget::InlineColumns { table, columns } if !columns.is_empty() => {
+                let projection = columns.iter().map(|name| column(name)).collect();
+                Expression::Select(Box::new(select_from(projection, with_sample(table))))
+            }
+            RewriteTarget::Inline(target) | RewriteTarget::InlineColumns { table: target, .. } => {
                 Expression::Select(Box::new(select_from(vec![star()], with_sample(target))))
             }
             RewriteTarget::Union(union) => {

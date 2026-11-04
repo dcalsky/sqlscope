@@ -5,7 +5,7 @@ Function               Purpose
 =====================  ==========================================================
 apply_row_filter       Filter every in-scope table by a predicate.
 inject_ctes            Prepend CTE definitions to a query's root ``WITH``.
-rewrite_tables         Replace table references with derived tables.
+rewrite_tables         Replace table references with other tables or derived tables.
 column_origins         Source columns whose values reach the result (lineage).
 output_columns         Names of the columns a statement outputs.
 referenced_columns     Columns referenced anywhere, per table.
@@ -41,7 +41,7 @@ from ._library import (
     load,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "Clause",
@@ -107,12 +107,15 @@ class UnionRewrite:
 class TableRewrite:
     """Replaces references to ``match_key`` (``schema.table``).
 
-    Set exactly one of ``inline`` (``(SELECT * FROM inline)``) or ``union``.
+    Set exactly one of ``inline``, ``union``, or ``rename``. Optional ``columns``
+    selects identifier values from the inline target (empty selects all).
     """
 
     match_key: str
     inline: Optional[TableRef] = None
     union: Optional[UnionRewrite] = None
+    columns: Optional[Sequence[str]] = None
+    rename: Optional[TableRef] = None
 
 
 class Clause(str, Enum):
@@ -239,7 +242,7 @@ def rewrite_tables(
 ) -> str:
     """Replace physical table references according to ``rewrites``.
 
-    Matched references become derived tables that keep their alias (or bare
+    Matched references keep their alias (or bare
     name); qualified column references are rebound onto it. Catalogs listed in
     ``strip_catalogs`` are transparent while matching. Returns the input
     unchanged when nothing matches.
@@ -248,6 +251,8 @@ def rewrite_tables(
         {
             "matchKey": rewrite.match_key,
             "inline": _table(rewrite.inline) if rewrite.inline is not None else None,
+            **({"columns": list(rewrite.columns)} if rewrite.columns else {}),
+            **({"rename": _table(rewrite.rename)} if rewrite.rename is not None else {}),
             "union": {
                 "tableAlias": rewrite.union.table_alias,
                 "columns": list(rewrite.union.columns),

@@ -5,7 +5,7 @@
  * | --- | --- |
  * | {@link applyRowFilter} | Filter every in-scope table by a predicate. |
  * | {@link injectCtes} | Prepend CTE definitions to a query's root `WITH`. |
- * | {@link rewriteTables} | Replace table references with derived tables. |
+ * | {@link rewriteTables} | Replace table references with other tables or derived tables. |
  * | {@link columnOrigins} | Source columns whose values reach the result (lineage). |
  * | {@link outputColumns} | Names of the columns a statement outputs. |
  * | {@link referencedColumns} | Columns referenced anywhere, per table. |

@@ -54,6 +54,16 @@ test("rewriteTables", () => {
   );
 });
 
+test("rewriteTables projects columns and renames joined tables", () => {
+  assert.equal(
+    sqlscope.rewriteTables("SELECT t.a FROM s.t JOIN s.r ON t.a = r.a", [
+      { matchKey: "s.t", inline: { table: "x" }, columns: ["a", "end"] },
+      { matchKey: "s.r", rename: { table: "y" } },
+    ]),
+    'SELECT t.a FROM (SELECT a, "end" FROM x) AS t JOIN y AS r ON t.a = r.a',
+  );
+});
+
 test("rewriteTables requires one target", () => {
   assert.throws(() => sqlscope.rewriteTables("SELECT 1", [{ matchKey: "s.t" }]), sqlscope.InvalidArgumentError);
 });

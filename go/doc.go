@@ -2,7 +2,7 @@
 //
 //	ApplyRowFilter      filter every in-scope table by a predicate
 //	InjectCTEs          prepend CTE definitions to a query's root WITH
-//	RewriteTables       replace table references with derived tables
+//	RewriteTables       replace table references with other tables or derived tables
 //	ColumnOrigins       source columns whose values reach the result (lineage)
 //	OutputColumns       names of the columns a statement outputs
 //	ReferencedColumns   columns referenced anywhere, per table

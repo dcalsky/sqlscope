@@ -15,7 +15,7 @@ npm install sqlscope-rs
 | --- | --- |
 | `applyRowFilter` | Filter every in-scope table by a predicate (row-level security). |
 | `injectCtes` | Prepend CTE definitions to a query's root `WITH`. |
-| `rewriteTables` | Replace table references with derived tables. |
+| `rewriteTables` | Replace table references with other tables or derived tables. |
 | `columnOrigins` | Source columns whose values reach the result (column lineage). |
 | `outputColumns` | Names of the columns a statement outputs. |
 | `referencedColumns` | Columns referenced anywhere (filters included), per table. |

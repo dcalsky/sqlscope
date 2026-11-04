@@ -77,12 +77,16 @@ export interface UnionRewrite {
 
 /**
  * Replaces references to `matchKey` (`schema.table`). Set exactly one of
- * `inline`, which becomes `(SELECT * FROM inline)`, or `union`.
+ * `inline`, `union`, or `rename`.
  */
 export interface TableRewrite {
   matchKey: string;
   inline?: TableRef;
   union?: UnionRewrite;
+  /** Column names for inline; an empty list selects all columns. */
+  columns?: readonly string[];
+  /** Replace the table name directly. */
+  rename?: TableRef;
 }
 
 /** The SQL clause that contains a column reference. */
@@ -179,7 +183,7 @@ export function injectCtes(
 /**
  * Replace physical table references according to `rewrites`.
  *
- * Matched references become derived tables that keep their alias (or bare
+ * Matched references keep their alias (or bare
  * name); qualified column references are rebound onto it. Returns the input
  * unchanged when nothing matches.
  */
@@ -187,6 +191,8 @@ export function rewriteTables(sql: string, rewrites: Iterable<TableRewrite>, opt
   const plan = Array.from(rewrites, (rewrite) => ({
     matchKey: rewrite.matchKey,
     inline: rewrite.inline && table(rewrite.inline),
+    rename: rewrite.rename && table(rewrite.rename),
+    columns: rewrite.columns,
     union: rewrite.union && {
       tableAlias: rewrite.union.tableAlias,
       columns: Array.from(rewrite.union.columns),

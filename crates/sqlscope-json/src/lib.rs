@@ -46,6 +46,8 @@ struct Union {
 struct Rewrite {
     match_key: String,
     inline: Option<Table>,
+    columns: Option<Vec<String>>,
+    rename: Option<Table>,
     union: Option<Union>,
 }
 
@@ -161,16 +163,28 @@ fn dispatch(operation: &str, request: Request) -> Result<Value, Error> {
         "rewrite_tables" => {
             let mut plan = Vec::with_capacity(rewrites.len());
             for rewrite in rewrites {
-                let target = match (rewrite.inline, rewrite.union) {
-                    (Some(table), None) => RewriteTarget::Inline(table.into()),
-                    (None, Some(union)) => RewriteTarget::Union(UnionRewrite {
+                let columns = rewrite.columns.unwrap_or_default();
+                if !columns.is_empty() && rewrite.inline.is_none() {
+                    return Err(invalid_error(format!(
+                        "table rewrite {:?}: columns require inline",
+                        rewrite.match_key
+                    )));
+                }
+                let target = match (rewrite.inline, rewrite.union, rewrite.rename) {
+                    (Some(table), None, None) if !columns.is_empty() => RewriteTarget::InlineColumns {
+                        table: table.into(),
+                        columns,
+                    },
+                    (None, None, Some(table)) => RewriteTarget::Rename(table.into()),
+                    (Some(table), None, None) => RewriteTarget::Inline(table.into()),
+                    (None, Some(union), None) => RewriteTarget::Union(UnionRewrite {
                         table_alias: union.table_alias,
                         columns: union.columns,
                         branches: union.branches.into_iter().map(Into::into).collect(),
                     }),
                     _ => {
                         return Err(invalid_error(format!(
-                            "table rewrite {:?} must have exactly one of inline or union",
+                            "table rewrite {:?} must have exactly one of inline, union, or rename",
                             rewrite.match_key
                         )))
                     }

@@ -56,6 +56,19 @@ fn inline_rewrite_keeps_literals() {
 }
 
 #[test]
+fn rename_and_inline_projection_rebind_colliding_names() {
+    check(
+        r#"SELECT s1.t.*, s2.t.id, "s1.t" FROM s1.t JOIN s2.t ON s1.t.id = s2.t.id"#,
+        &[
+            TableRewrite::rename("s1.t", TableRef::new("Phys")),
+            TableRewrite::inline_columns("s2.t", TableRef::new("x"), vec!["id".into()]),
+        ],
+        Options::new(),
+        r#"SELECT s1_t.*, s2_t.id, "s1.t" FROM "Phys" AS s1_t JOIN (SELECT id FROM x) AS s2_t ON s1_t.id = s2_t.id"#,
+    );
+}
+
+#[test]
 fn strip_catalogs() {
     check(
         r#"SELECT col1 FROM "vdm_rda".myschema.mytable WHERE col1 = 'a'"#,

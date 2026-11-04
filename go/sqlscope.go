@@ -23,11 +23,14 @@ type UnionRewrite struct {
 }
 
 // TableRewrite replaces references to MatchKey ("schema.table"). Set exactly
-// one of Inline, which becomes (SELECT * FROM Inline), or Union.
+// one of Inline, Union, or Rename. Columns lists identifier values for Inline;
+// omitted or empty Columns selects *. Rename changes the table name directly.
 type TableRewrite struct {
 	MatchKey string        `json:"matchKey"`
 	Inline   *TableRef     `json:"inline,omitempty"`
 	Union    *UnionRewrite `json:"union,omitempty"`
+	Columns  []string      `json:"columns,omitempty"`
+	Rename   *TableRef     `json:"rename,omitempty"`
 }
 
 // ColumnClause is the SQL clause that contains a column reference.
@@ -106,7 +109,7 @@ func InjectCTEs(sql string, ctes []CTEDef, opts ...Option) (string, error) {
 }
 
 // RewriteTables replaces physical table references in a query according to
-// rewrites. Matched references become derived tables that keep their alias,
+// rewrites. Matched references keep their alias,
 // or their bare name when unaliased (disambiguated on collisions); qualified
 // column and star references are rebound onto it. CTE references are never
 // replaced. Catalogs given to WithStripCatalogs are transparent while
