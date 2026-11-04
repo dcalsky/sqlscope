@@ -50,7 +50,7 @@ pub fn output_columns(sql: &str, options: &Options) -> Result<Option<Vec<String>
             return Err(Error::unsupported("INSERT without a target column list"));
         }
     }
-    if let Some(columns) = declared_columns(&statement, &options.schema)? {
+    if let Some(columns) = declared_columns(&statement, options)? {
         return Ok(Some(columns));
     }
     let Some(query) = ast::inner_query(&statement) else {
@@ -65,7 +65,7 @@ fn names<'n>(names: impl Iterator<Item = &'n str>) -> Vec<String> {
 
 /// Columns declared by DDL: an explicit view / CTAS column list, or the
 /// column definitions and LIKE clauses of CREATE TABLE.
-fn declared_columns(statement: &Expression, schema: &schema::Schema) -> Result<Option<Vec<String>>> {
+fn declared_columns(statement: &Expression, options: &Options) -> Result<Option<Vec<String>>> {
     match statement {
         Expression::CreateView(view) if !view.columns.is_empty() => {
             Ok(Some(names(view.columns.iter().map(|c| c.name.name.as_str()))))
@@ -91,14 +91,20 @@ fn declared_columns(statement: &Expression, schema: &schema::Schema) -> Result<O
                 positioned &= start.is_some();
                 entries.push((start.unwrap_or(usize::MAX), vec![column.name.name.clone()]));
             }
+            let mut lookup = None;
             let mut liked = false;
             for constraint in &table.constraints {
                 if let TableConstraint::Like { source, .. } = constraint {
                     let start = source.name.span.map(|span| span.start);
                     positioned &= start.is_some();
-                    let source = qualified_name(source);
-                    let source_columns = schema::columns(schema, &source)
-                        .ok_or_else(|| Error::unsupported(format!("CREATE TABLE LIKE {source} requires its schema")))?;
+                    let schema =
+                        lookup.get_or_insert_with(|| schema::SchemaLookup::new(&options.schema, options.dialect));
+                    let source_columns = schema.columns(source).ok_or_else(|| {
+                        Error::unsupported(format!(
+                            "CREATE TABLE LIKE {} requires its schema",
+                            qualified_name(source)
+                        ))
+                    })?;
                     entries.push((start.unwrap_or(usize::MAX), source_columns.to_vec()));
                     liked = true;
                 }

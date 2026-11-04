@@ -429,3 +429,22 @@ func TestNilSchemaColumns(t *testing.T) {
 		}
 	}
 }
+
+func TestReferencedColumnsTrinoSchemaCase(t *testing.T) {
+	schema := map[string][]string{"s.a": {"id", "x"}, "s.b": {"id", "z"}}
+	for _, tc := range []struct {
+		sql  string
+		want map[string][]string
+	}{
+		{"SELECT x, z FROM s.a JOIN s.b ON a.id = b.id", map[string][]string{"s.a": {"id", "x"}, "s.b": {"id", "z"}}},
+		{"SELECT x, z FROM S.A JOIN S.B ON a.id = b.id", map[string][]string{"S.A": {"id", "x"}, "S.B": {"id", "z"}}},
+		{"SELECT * FROM S.A", map[string][]string{"S.A": {"id", "x"}}},
+	} {
+		t.Run(tc.sql, func(t *testing.T) {
+			got, err := sqlscope.ReferencedColumns(tc.sql, sqlscope.WithSchema(schema), sqlscope.WithDialect("trino"))
+			if err != nil || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %v, error %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+}

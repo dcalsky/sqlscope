@@ -24,7 +24,7 @@ use polyglot_sql::{Expression, ExpressionWalk};
 use crate::ast::{ident_key, inner_query, is_query, qualified_name, table_names_match};
 use crate::column_usages::{Clause, ColumnUsage};
 use crate::options::Options;
-use crate::schema::{self, Schema};
+use crate::schema::SchemaLookup;
 
 /// A `(root table, column)` pair.
 pub(crate) type ColRef = (String, String);
@@ -68,9 +68,10 @@ impl Output {
     }
 }
 
-enum Source {
+enum Source<'a> {
     Physical {
         table: String,
+        columns: Option<&'a [String]>,
     },
     Derived {
         out: Rc<Output>,
@@ -81,10 +82,10 @@ enum Source {
     Opaque,
 }
 
-impl Source {
+impl Source<'_> {
     fn roots(&self) -> Vec<String> {
         match self {
-            Source::Physical { table } => vec![table.clone()],
+            Source::Physical { table, .. } => vec![table.clone()],
             Source::Derived { roots, .. } => roots.clone(),
             Source::Opaque => Vec::new(),
         }
@@ -112,8 +113,8 @@ struct CteEntry<'a> {
 
 #[derive(Default)]
 struct Scope<'a> {
-    sources: RefCell<Vec<Rc<Source>>>,
-    by_alias: RefCell<HashMap<String, Rc<Source>>>,
+    sources: RefCell<Vec<Rc<Source<'a>>>>,
+    by_alias: RefCell<HashMap<String, Rc<Source<'a>>>>,
     /// Source index -> the columns it shares with earlier sources, which an
     /// unqualified `*` outputs once.
     shared: RefCell<HashMap<usize, SharedColumns>>,
@@ -132,7 +133,7 @@ struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    fn push(&self, alias: Option<String>, source: Source) {
+    fn push(&self, alias: Option<String>, source: Source<'a>) {
         let source = Rc::new(source);
         if let Some(alias) = alias.filter(|alias| !alias.is_empty()) {
             self.by_alias.borrow_mut().insert(alias, source.clone());
@@ -140,14 +141,18 @@ impl<'a> Scope<'a> {
         self.sources.borrow_mut().push(source);
     }
 
-    fn physical_tables(&self) -> Vec<String> {
+    fn matching_physical_tables(&self, qualifier: &str) -> Vec<Rc<Source<'a>>> {
+        let mut seen = HashSet::new();
         self.sources
             .borrow()
             .iter()
-            .filter_map(|source| match source.as_ref() {
-                Source::Physical { table } => Some(table.clone()),
-                Source::Derived { .. } | Source::Opaque => None,
+            .filter(|source| match source.as_ref() {
+                Source::Physical { table, .. } => {
+                    table_names_match(qualifier, &table.to_lowercase()) && seen.insert(table.clone())
+                }
+                _ => false,
             })
+            .cloned()
             .collect()
     }
 
@@ -179,8 +184,8 @@ impl<'a> Scope<'a> {
     }
 }
 
-pub(crate) struct Resolver<'a, 's> {
-    schema: &'s Schema,
+pub(crate) struct Resolver<'a> {
+    schema: SchemaLookup<'a>,
     /// BigQuery: `FROM t, t.arr` reads a field of `t`, not a table.
     correlated_paths: bool,
     flow_only: bool,
@@ -197,7 +202,7 @@ pub(crate) struct Resolver<'a, 's> {
     entering_derived: bool,
 }
 
-impl Drop for Resolver<'_, '_> {
+impl Drop for Resolver<'_> {
     fn drop(&mut self) {
         // CTE entries and their body scopes reference each other.
         for entry in &self.entries {
@@ -296,10 +301,10 @@ fn as_query(expression: &Expression) -> Option<&Expression> {
     }
 }
 
-impl<'a, 's> Resolver<'a, 's> {
-    pub(crate) fn new(options: &'s Options, flow_only: bool, track_usages: bool) -> Self {
+impl<'a> Resolver<'a> {
+    pub(crate) fn new(options: &'a Options, flow_only: bool, track_usages: bool) -> Self {
         Self {
-            schema: &options.schema,
+            schema: SchemaLookup::new(&options.schema, options.dialect),
             correlated_paths: options.dialect.correlates_paths(),
             flow_only,
             result: BTreeMap::new(),
@@ -662,7 +667,7 @@ impl<'a, 's> Resolver<'a, 's> {
                 }
                 // USING (k) names a column shared by both sides.
                 for column in &join.using {
-                    let refs = self.resolve_unqualified(&column.name, &scope);
+                    let refs = self.resolve_unqualified(column, &scope);
                     self.add_refs(&refs, Clause::JoinUsing);
                 }
             }
@@ -914,9 +919,10 @@ impl<'a, 's> Resolver<'a, 's> {
         }
         let root = qualified_name(table);
         self.result.entry(root.clone()).or_default();
+        let columns = self.schema.columns(table);
         if !table.column_aliases.is_empty() {
             let mut out = Output::default();
-            match schema::columns(self.schema, &root) {
+            match columns {
                 Some(columns) => {
                     for column in columns {
                         out.add(column.clone(), vec![(root.clone(), column.clone())]);
@@ -933,7 +939,7 @@ impl<'a, 's> Resolver<'a, 's> {
             let out = apply_column_aliases(Rc::new(out), &names(&table.column_aliases));
             scope.push(Some(alias), Source::Derived { out, roots: vec![root] });
         } else {
-            scope.push(Some(alias), Source::Physical { table: root });
+            scope.push(Some(alias), Source::Physical { table: root, columns });
         }
     }
 
@@ -948,7 +954,7 @@ impl<'a, 's> Resolver<'a, 's> {
                 self.collect(on, scope, Clause::JoinOn, None);
             }
             for column in &join.using {
-                let refs = self.resolve_unqualified(&column.name, scope);
+                let refs = self.resolve_unqualified(column, scope);
                 self.add_refs(&refs, Clause::JoinUsing);
             }
         }
@@ -1044,7 +1050,7 @@ impl<'a, 's> Resolver<'a, 's> {
                     out.push((name.clone(), refs));
                 }
             }
-            Source::Physical { table } => match schema::columns(self.schema, table) {
+            Source::Physical { table, columns } => match columns {
                 Some(columns) => {
                     for column in columns.iter().cloned() {
                         out.push((column.clone(), vec![(table.clone(), column)]));
@@ -1095,15 +1101,10 @@ impl<'a, 's> Resolver<'a, 's> {
                 return out;
             }
             // A qualified star (`raw.users.*`) names a physical table.
-            let mut matched: Vec<String> = Vec::new();
-            for table in level.physical_tables() {
-                if table_names_match(&qualifier, &table.to_lowercase()) && !matched.contains(&table) {
-                    matched.push(table);
-                }
-            }
+            let matched = level.matching_physical_tables(&qualifier);
             if !matched.is_empty() {
-                for table in matched {
-                    emit(&Source::Physical { table }, &mut out);
+                for source in matched {
+                    emit(&source, &mut out);
                 }
                 return out;
             }
@@ -1243,7 +1244,11 @@ impl<'a, 's> Resolver<'a, 's> {
                 return refs;
             }
         }
-        let refs = self.resolve(&qualifier, name, scope);
+        let refs = if qualifier.is_empty() {
+            self.resolve_unqualified(&column.name, scope)
+        } else {
+            Self::resolve_qualified(&qualifier, name, scope)
+        };
         self.add_refs(&refs, clause);
         refs
     }
@@ -1255,7 +1260,7 @@ impl<'a, 's> Resolver<'a, 's> {
         if column.is_empty() {
             return Vec::new();
         }
-        let refs = self.resolve(&qualifier, &column, scope);
+        let refs = Self::resolve_qualified(&qualifier, &column, scope);
         self.add_refs(&refs, clause);
         refs
     }
@@ -1264,21 +1269,13 @@ impl<'a, 's> Resolver<'a, 's> {
     // Attribution
     // -----------------------------------------------------------------------
 
-    fn resolve(&self, qualifier: &str, name: &str, scope: &Rc<Scope<'a>>) -> Vec<ColRef> {
-        if qualifier.is_empty() {
-            self.resolve_unqualified(name, scope)
-        } else {
-            Self::resolve_qualified(qualifier, name, scope)
-        }
-    }
-
     fn resolve_qualified(qualifier: &str, name: &str, scope: &Rc<Scope<'a>>) -> Vec<ColRef> {
         let mut current = Some(scope.clone());
         while let Some(level) = current {
             let source = level.by_alias.borrow().get(qualifier).cloned();
             if let Some(source) = source {
                 return match source.as_ref() {
-                    Source::Physical { table } => vec![(table.clone(), name.to_owned())],
+                    Source::Physical { table, .. } => vec![(table.clone(), name.to_owned())],
                     // A name missing from a derived output (an unexpanded
                     // star) is attributed to the derived source's roots.
                     Source::Derived { out, roots } => out.refs(name).cloned().unwrap_or_else(|| refs_for(roots, name)),
@@ -1286,14 +1283,10 @@ impl<'a, 's> Resolver<'a, 's> {
                     Source::Opaque => refs_for(&scope.chain_roots(), name),
                 };
             }
-            let mut matched: Vec<String> = Vec::new();
-            for table in level.physical_tables() {
-                if table_names_match(qualifier, &table.to_lowercase()) && !matched.contains(&table) {
-                    matched.push(table);
-                }
-            }
+            let matched = level.matching_physical_tables(qualifier);
             if !matched.is_empty() {
-                return refs_for(&matched, name);
+                let tables = matched.iter().flat_map(|source| source.roots()).collect::<Vec<_>>();
+                return refs_for(&tables, name);
             }
             current = level.parent.clone();
         }
@@ -1306,7 +1299,8 @@ impl<'a, 's> Resolver<'a, 's> {
         }
     }
 
-    fn resolve_unqualified(&self, name: &str, scope: &Rc<Scope<'a>>) -> Vec<ColRef> {
+    fn resolve_unqualified(&self, column: &Identifier, scope: &Rc<Scope<'a>>) -> Vec<ColRef> {
+        let name = column.name.as_str();
         if name.is_empty() {
             return Vec::new();
         }
@@ -1327,9 +1321,9 @@ impl<'a, 's> Resolver<'a, 's> {
                         unknown.extend(roots.iter().cloned());
                     }
                 }
-                Source::Physical { table } => match schema::columns(self.schema, table) {
+                Source::Physical { table, columns } => match columns {
                     Some(columns) => {
-                        if columns.iter().any(|column| column == name) {
+                        if self.schema.has_column(columns, column) {
                             refs.push((table.clone(), name.to_owned()));
                         }
                     }
@@ -1352,7 +1346,7 @@ impl<'a, 's> Resolver<'a, 's> {
         // Every current source is fully known and none has the name: SQL
         // correlation resolves it against enclosing scopes.
         if let Some(parent) = &scope.parent {
-            let found = self.resolve_unqualified(name, parent);
+            let found = self.resolve_unqualified(column, parent);
             if !found.is_empty() {
                 return found;
             }
@@ -1501,7 +1495,7 @@ impl<'a, 's> Resolver<'a, 's> {
                 self.collect(on, scope, Clause::JoinOn, None);
             }
             for column in &join.using {
-                let refs = self.resolve_unqualified(&column.name, scope);
+                let refs = self.resolve_unqualified(column, scope);
                 self.add_refs(&refs, Clause::JoinUsing);
             }
         }

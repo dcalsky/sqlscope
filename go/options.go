@@ -59,7 +59,9 @@ func WithDialect(dialect string) Option {
 }
 
 // WithSchema supplies table schemas: table name -> ordered column names. Keys
-// may be bare, schema- or catalog-qualified. The schema expands wildcards and
+// may be bare, schema- or catalog-qualified. Supply catalog names without SQL
+// quote delimiters. Matching follows the dialect's case rules, so Trino
+// matches S.A to s.a. The schema expands wildcards and
 // attributes unqualified columns. A table listed with no columns has zero
 // columns; an absent table is unknown.
 //

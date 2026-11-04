@@ -144,7 +144,11 @@ are ignored.
 | `strip_catalogs` | `strip_catalogs` | `WithStripCatalogs` | `stripCatalogs` | `rewrite_tables` |
 
 `schema` maps table names (bare, `schema.table` or `catalog.schema.table`) to
-their ordered columns. It expands `*` and attributes unqualified columns. A
+their ordered columns. Supply names with their catalog spelling, without SQL
+quote delimiters. In Trino, `s.a`, `S.A` and `"S"."A"` match the same schema
+entry. Conflicting column lists for equivalent keys leave the schema unknown.
+Results use the table spelling from the query, and `*` expands using the
+declared column names in order. The schema also attributes unqualified columns. A
 table listed with no columns has zero columns; an unlisted table is unknown.
 A reference matches its exact key, else the unique key it is a suffix of
 (`orders` -> `sales.orders`), else the longest key that is a suffix of it

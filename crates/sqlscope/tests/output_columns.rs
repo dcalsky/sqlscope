@@ -235,3 +235,58 @@ fn row_field_access() {
     let got = output_columns("SELECT t.c.f FROM c.s.t t", &t()).unwrap().unwrap();
     assert!(got == ["f"] || got == ["_col0"], "{got:?}");
 }
+
+#[test]
+fn schema_folds_table_names_before_resolving_suffixes() {
+    let opts = t().schema([("hive.Raw.Orders", ["Amount", "Id"]), ("orders", ["bare", "id"])]);
+    check("SELECT * FROM RAW.ORDERS", &["Amount", "Id"], opts.clone());
+    check(
+        "SELECT RAW.ORDERS.* FROM HIVE.RAW.ORDERS",
+        &["Amount", "Id"],
+        opts.clone(),
+    );
+    check("SELECT * FROM ORDERS", &["bare", "id"], opts);
+    let opts = t().schema([("orders", ["bare"]), ("Raw.Orders", ["qualified"])]);
+    check("SELECT * FROM hive.raw.ORDERS", &["qualified"], opts.clone());
+    check("CREATE TABLE copy (LIKE HIVE.RAW.ORDERS)", &["qualified"], opts);
+    check(
+        "SELECT * FROM ORDERS",
+        &["*"],
+        t().schema([("x.Orders", ["x"]), ("y.orders", ["y"])]),
+    );
+    check(
+        "SELECT * FROM orders",
+        &["*"],
+        t().schema([("ORDERS", ["x"]), ("orders", ["y"])]),
+    );
+    check(
+        "SELECT * FROM EMPTY",
+        &[],
+        t().schema([("Empty", Vec::<String>::new())]),
+    );
+}
+
+#[test]
+fn schema_case_depends_on_dialect_and_quoting() {
+    check(r#"SELECT * FROM "S.A""#, &["*"], t().schema([("a", ["wrong"])]));
+    let pg = options("postgres").schema([("s.a", ["unquoted"]), ("s.A", ["quoted"])]);
+    check("SELECT * FROM S.A", &["unquoted"], pg.clone());
+    check(r#"SELECT * FROM S."A""#, &["quoted"], pg.clone());
+    check(r#"SELECT * FROM "S"."A""#, &["*"], pg);
+    check(
+        "SELECT * FROM Mixed",
+        &["*"],
+        options("postgres").schema([("Mixed", ["quoted"])]),
+    );
+    check(
+        "SELECT * FROM OrDeRs",
+        &["id"],
+        options("snowflake").schema([("orders", ["id"])]),
+    );
+    let sf = options("snowflake").schema([("S.T", ["UPPER"]), ("S.t", ["lower"])]);
+    check("SELECT * FROM s.t", &["UPPER"], sf.clone());
+    check(r#"SELECT * FROM s."t""#, &["lower"], sf);
+    for dialect in ["clickhouse", "bigquery", "mysql"] {
+        check("SELECT * FROM S.A", &["*"], options(dialect).schema([("s.a", ["id"])]));
+    }
+}

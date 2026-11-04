@@ -720,3 +720,39 @@ fn superset_invariant() {
         }
     }
 }
+
+#[test]
+fn schema_case_folds_only_for_lookup() {
+    let opts = t().schema([("s.A", ["Id", "x"]), ("S.b", ["id", "z"])]);
+    let sql = r#"SELECT X, "Z" FROM "S"."a" JOIN s.B ON a.Id = b.id"#;
+    assert_refs(sql, &[("S.a", &["Id", "X"]), ("s.B", &["Z", "id"])], opts.clone());
+    assert_eq!(
+        column_origins(sql, &opts).unwrap(),
+        map(&[("S.a", &["X"]), ("s.B", &["Z"])])
+    );
+    assert_usages(
+        sql,
+        &[
+            ("S.a", "X", Select),
+            ("s.B", "Z", Select),
+            ("S.a", "Id", JoinOn),
+            ("s.B", "id", JoinOn),
+        ],
+        opts,
+    );
+}
+
+#[test]
+fn postgres_schema_columns_respect_quotes() {
+    let opts = options("postgres").schema([("s.a", ["Mixed"]), ("s.b", ["mixed"])]);
+    assert_refs(
+        r#"SELECT "Mixed" FROM S.A CROSS JOIN S.B"#,
+        &[("S.A", &["Mixed"]), ("S.B", &[])],
+        opts.clone(),
+    );
+    assert_refs(
+        "SELECT Mixed FROM S.A CROSS JOIN S.B",
+        &[("S.A", &[]), ("S.B", &["Mixed"])],
+        opts,
+    );
+}
