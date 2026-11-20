@@ -7,7 +7,7 @@ use regex::Regex;
 
 use crate::ast::{self, opt_name};
 use crate::error::{Error, Result};
-use crate::normalize::{prepare_rewrite, strip_comments};
+use crate::normalize::prepare_rewrite;
 use crate::options::{Dialect, Options};
 use crate::rewrite::{
     derived_table, rewrite_statement, select_from, star, unaliased, unqualified_table_keys, AliasRef, Replacement,
@@ -56,10 +56,10 @@ use crate::rewrite::{
 pub fn apply_row_filter(sql: &str, predicate: &str, options: &Options) -> Result<String> {
     let dialect = options.dialect;
     let scope = TableScope::compile(options)?;
-    let predicate_text = predicate;
-    let predicate = parse_predicate(predicate, dialect)?;
+    let predicate_text = prepare_rewrite(predicate, dialect).map_err(|error| error.context("predicate"))?;
+    let predicate = parse_predicate(&predicate_text, dialect)?;
 
-    let normalized = prepare_rewrite(sql, dialect);
+    let normalized = prepare_rewrite(sql, dialect)?;
     let statement = ast::parse_query(&normalized, dialect)?;
     let filter = RowFilter {
         reads: Arc::new(unqualified_table_keys(&predicate)),
@@ -70,7 +70,7 @@ pub fn apply_row_filter(sql: &str, predicate: &str, options: &Options) -> Result
     })? {
         None => Ok(sql.to_owned()),
         Some(rewritten) => {
-            let probe = format!("SELECT 1 WHERE {}", strip_comments(predicate_text, dialect));
+            let probe = format!("SELECT 1 WHERE {predicate_text}");
             ast::generate_checked(&rewritten, dialect, &[&normalized, &probe])
         }
     }
@@ -104,13 +104,10 @@ impl Replacement for RowFilter {
 
 /// Parses `text` as exactly one boolean expression.
 fn parse_predicate(text: &str, dialect: Dialect) -> Result<Expression> {
-    ast::guard_input(text).map_err(|error| error.context("predicate"))?;
-    let text = strip_comments(text, dialect);
     let text = text.trim();
     if text.is_empty() {
         return Err(Error::invalid("predicate must not be empty"));
     }
-    ast::guard_input(text).map_err(|error| error.context("predicate"))?;
     let invalid = || Error::invalid(format!("predicate {text:?} is not a single boolean expression"));
 
     let probe = format!("SELECT 1 WHERE {text}");
