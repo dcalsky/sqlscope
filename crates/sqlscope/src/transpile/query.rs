@@ -86,6 +86,16 @@ pub(super) fn ordinal_key<'a>(ordinal: &str, projections: &'a [Expression]) -> O
 
 pub(super) fn mysql_grouping(group: &mut polyglot_sql::expressions::GroupBy, strict: bool) -> Result<()> {
     let [Expression::Function(f)] = group.expressions.as_mut_slice() else {
+        // WITH ROLLUP applies to every key. Extending a partial ROLLUP to
+        // its neighbours would introduce extra subtotal and grand total rows.
+        if strict
+            && group.expressions.iter().any(|e| {
+                matches!(e, Expression::Function(f) if !f.quoted && f.qualified_name.is_empty()
+                && (f.name.eq_ignore_ascii_case("ROLLUP") || f.name.eq_ignore_ascii_case("CUBE")))
+            })
+        {
+            return Err(polyglot_sql::Error::unsupported("mixed grouping sets", "mysql"));
+        }
         return Ok(());
     };
     if f.quoted || !f.qualified_name.is_empty() {

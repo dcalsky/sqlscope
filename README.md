@@ -36,7 +36,7 @@ library in the Python package directory (Python) or next to the executable
 
 | Language | Package |
 | --- | --- |
-| Rust | `cargo add sqlscope` |
+| Rust | `cargo add --git https://github.com/dcalsky/sqlscope --tag v0.7.0 sqlscope` |
 | C / C++ / others | link `sqlscope-ffi` from a release; see `sqlscope.h` |
 | Python | `pip install sqlscope-rs` (imported as `sqlscope`; pure Python, ≥ 3.9) |
 | Go | `go get github.com/dcalsky/sqlscope/go` (no cgo; uses [purego](https://github.com/ebitengine/purego)) |

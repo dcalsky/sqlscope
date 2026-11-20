@@ -50,3 +50,15 @@ fn calcite_dialect_pairs() {
     assert_eq!(paired, 25);
     assert!(diffs.is_empty(), "{}", diffs.join("\n"));
 }
+
+#[test]
+fn partial_rollup_cannot_be_widened_to_all_mysql_grouping_keys() {
+    let query = "SELECT region, year, COUNT(*) FROM sales GROUP BY region, ROLLUP(year)";
+    assert_eq!(
+        transpile(query, Dialect::TRINO, Dialect::MYSQL, TranspileMode::Strict)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    assert!(transpile(query, Dialect::TRINO, Dialect::STARROCKS, TranspileMode::Strict).is_ok());
+}
