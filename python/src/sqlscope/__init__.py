@@ -185,7 +185,8 @@ def transpile(sql: str, source: str, target: str, *, mode: str = "strict") -> Li
 
     Use mode="best_effort" to allow lossy conversions for unsupported features.
     """
-    return call("transpile", {"sql": sql, "source": source, "target": target, "mode": mode})
+    statements: List[str] = call("transpile", {"sql": sql, "source": source, "target": target, "mode": mode})
+    return statements
 
 
 def apply_row_filter(
