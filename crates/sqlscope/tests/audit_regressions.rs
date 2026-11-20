@@ -471,9 +471,6 @@ fn mysql_executable_comments_are_not_ignored() {
             assert_eq!(column_origins(sql, &opts).unwrap_err().kind(), ErrorKind::Unsupported);
             assert_eq!(output_columns(sql, &opts).unwrap_err().kind(), ErrorKind::Unsupported);
         }
-        // Rewrites regenerate SQL without comments, so hidden code is dropped.
-        let out = apply_row_filter("SELECT id FROM a /*!, users */", "t = 1", &opts).unwrap();
-        assert!(!out.contains("users"), "{out}");
         // Optimizer hints are not executable comments.
         assert!(referenced_columns("SELECT /*+ SET_VAR(x=1) */ id FROM a", &opts).is_ok());
     }
@@ -748,11 +745,23 @@ fn clickhouse_input_the_parser_skips_is_rejected() {
 fn keyword_aliases_the_engine_reads_as_syntax_are_rejected() {
     for (dialect, sql) in [
         (Dialect::CLICKHOUSE, "SELECT * FROM a GLOBAL JOIN b USING id"),
-        (Dialect::ORACLE, "SELECT * FROM a PARTITION (p1)"),
         (Dialect::DORIS, "SELECT * FROM a PARTITIONS (p1)"),
     ] {
         let error = apply_row_filter(sql, "t = 1", &Options::new().dialect(dialect)).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported, "{sql}: {error}");
+    }
+}
+
+#[test]
+fn oracle_partition_selection_survives_row_filtering() {
+    let options = Options::new().dialect(Dialect::ORACLE);
+    for keyword in ["PARTITION", "SUBPARTITION"] {
+        let sql = format!("SELECT id FROM a {keyword} (p1)");
+        assert_eq!(referenced_columns(&sql, &options).unwrap()["a"], ["id"]);
+        assert_eq!(
+            apply_row_filter(&sql, "id > 0", &options).unwrap(),
+            format!("SELECT id FROM (SELECT * FROM a {keyword}(p1) WHERE id > 0) a")
+        );
     }
 }
 
@@ -819,32 +828,32 @@ fn alias_wrapped_join_tables_keep_their_alias() {
 }
 
 #[test]
-fn tsql_table_hints_without_with_are_rejected() {
+fn tsql_table_hints_stay_on_the_filtered_physical_table() {
     let tsql = Options::new().dialect(Dialect::TSQL);
-    for sql in [
-        "SELECT * FROM dbo.t (NOLOCK)",
-        "SELECT * FROM [dbo].[t] (NOLOCK) x",
-        "SELECT * FROM a JOIN t (NOLOCK, INDEX(i)) ON a.id = t.id",
-        "SELECT * FROM a CROSS APPLY t (NOLOCK)",
-        "SELECT * FROM t AS x (NOLOCK)",
-        "UPDATE s SET x = 1 FROM dbo.t AS s (ROWLOCK)",
+    for (from, rewritten) in [
+        ("dbo.t (NOLOCK)", "(SELECT * FROM dbo.t WITH (NOLOCK) WHERE flag = 1) AS t"),
+        ("[dbo].[t] (NOLOCK) x", "(SELECT * FROM [dbo].[t] WITH (NOLOCK) WHERE flag = 1) AS x"),
+        ("t AS x (NOLOCK)", "(SELECT * FROM t WITH (NOLOCK) WHERE flag = 1) AS x"),
+        ("a JOIN t (NOLOCK, INDEX(i)) ON a.id = t.id",
+            "(SELECT * FROM a WHERE flag = 1) AS a JOIN (SELECT * FROM t WITH (NOLOCK, INDEX(i)) WHERE flag = 1) AS t ON a.id = t.id"),
+        ("a CROSS APPLY t (NOLOCK)",
+            "(SELECT * FROM a WHERE flag = 1) AS a CROSS APPLY (SELECT * FROM t WITH (NOLOCK) WHERE flag = 1) AS t"),
+        ("dbo.t WITH (NOLOCK)", "(SELECT * FROM dbo.t WITH (NOLOCK) WHERE flag = 1) AS t"),
     ] {
-        assert_eq!(
-            referenced_columns(sql, &tsql).unwrap_err().kind(),
-            ErrorKind::Unsupported,
-            "{sql}"
-        );
-        assert_eq!(
-            apply_row_filter(sql, "t = 1", &tsql).unwrap_err().kind(),
-            ErrorKind::Unsupported,
-            "{sql}"
-        );
+        let sql = format!("SELECT * FROM {from}");
+        assert_eq!(apply_row_filter(&sql, "flag = 1", &tsql).unwrap(), format!("SELECT * FROM {rewritten}"));
     }
     assert_eq!(
-        apply_row_filter("SELECT * FROM dbo.t WITH (NOLOCK)", "x = 1", &tsql).unwrap(),
-        "SELECT * FROM (SELECT * FROM dbo.t WITH (NOLOCK) WHERE x = 1) AS t"
+        referenced_columns("SELECT id FROM dbo.t (NOLOCK)", &tsql).unwrap()["dbo.t"],
+        ["id"]
     );
-    assert!(apply_row_filter("SELECT ISNULL(nolock, 0) FROM dbo.fn(1) AS f", "x = 1", &tsql).is_ok());
+    let update = "UPDATE s SET x = 1 FROM dbo.t AS s (ROWLOCK)";
+    assert_eq!(referenced_columns(update, &tsql).unwrap()["dbo.t"], ["x"]);
+    assert_eq!(
+        apply_row_filter(update, "flag = 1", &tsql).unwrap_err().kind(),
+        ErrorKind::Unsupported
+    );
+    assert!(apply_row_filter("SELECT ISNULL(nolock, 0) FROM dbo.fn(1) AS f", "flag = 1", &tsql).is_ok());
 }
 
 #[test]
@@ -1045,6 +1054,210 @@ fn queries_with_unparsed_syntax_are_rejected() {
             referenced_columns(sql, &options).unwrap_err().kind(),
             ErrorKind::Unsupported,
             "{sql}"
+        );
+    }
+}
+
+#[test]
+fn rewrite_inputs_apply_the_same_comment_policy_as_analysis() {
+    for dialect in [Dialect::MYSQL, Dialect::STARROCKS] {
+        let opts = Options::new().dialect(dialect);
+        let sql = "SELECT id FROM s.t /*! */";
+        let cte = CteDef::new("c", "SELECT 1");
+        for result in [
+            apply_row_filter(sql, "id > 0", &opts),
+            apply_row_filter("SELECT 1", "TRUE /*! */", &opts),
+            rewrite_tables(sql, &renamed(), &opts),
+            inject_ctes(sql, &[cte], &opts),
+            inject_ctes("SELECT * FROM c", &[CteDef::new("c", sql)], &opts),
+        ] {
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::Unsupported, "{dialect}");
+        }
+    }
+    let trino = Options::new().dialect(Dialect::TRINO);
+    assert_eq!(
+        apply_row_filter("SELECT id FROM t /*! */", "id > 0", &trino).unwrap(),
+        "SELECT id FROM (SELECT * FROM t WHERE id > 0) AS t"
+    );
+}
+
+#[test]
+fn starrocks_compact_join_hint_keeps_both_relations() {
+    let opts = Options::new().dialect(Dialect::STARROCKS);
+    let sql = "SELECT l.id, r.name FROM lhs l JOIN[broadcast]rhs r ON l.id = r.id";
+    let refs = referenced_columns(sql, &opts).unwrap();
+    assert_eq!(refs["lhs"], ["id"]);
+    assert_eq!(refs["rhs"], ["id", "name"]);
+}
+
+#[test]
+fn using_projects_keys_in_dialect_order() {
+    let sql = "SELECT * FROM l JOIN r USING (b, a)";
+    for (dialect, keys) in [
+        (Dialect::MYSQL, ["a", "b"]),
+        (Dialect::TRINO, ["b", "a"]),
+        (Dialect::STARROCKS, ["b", "a"]),
+    ] {
+        let opts = Options::new()
+            .dialect(dialect)
+            .schema([("l", ["x", "a", "b"]), ("r", ["y", "b", "a"])]);
+        let names = output_columns(sql, &opts).unwrap().unwrap();
+        assert_eq!(names, [keys[0], keys[1], "x", "y"], "{dialect}");
+        let qualified = output_columns("SELECT r.* FROM l JOIN r USING (b, a)", &opts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(qualified, ["y", "b", "a"], "{dialect}");
+        let origins = column_origins(&format!("WITH j(p,q,s,t) AS ({sql}) SELECT q FROM j"), &opts).unwrap();
+        assert_eq!(origins["l"], [keys[1]]);
+        assert_eq!(origins["r"], [keys[1]]);
+    }
+}
+
+#[test]
+fn mysql_natural_right_join_uses_the_right_relation_first() {
+    let opts = Options::new()
+        .dialect(Dialect::MYSQL)
+        .schema([("l", ["x", "k"]), ("r", ["y", "k"])]);
+    let names = output_columns("SELECT * FROM l NATURAL RIGHT JOIN r", &opts)
+        .unwrap()
+        .unwrap();
+    assert_eq!(names, ["k", "y", "x"]);
+}
+
+#[test]
+fn using_keys_stay_with_their_join_operands() {
+    for dialect in [Dialect::MYSQL, Dialect::TRINO, Dialect::STARROCKS] {
+        let options =
+            Options::new()
+                .dialect(dialect)
+                .schema([("extra", ["p", "k"]), ("l", ["x", "k"]), ("r", ["y", "k"])]);
+        for from in ["extra, l JOIN r USING (k)", "extra CROSS JOIN (l JOIN r USING (k))"] {
+            let names = output_columns(&format!("SELECT * FROM {from}"), &options)
+                .unwrap()
+                .unwrap();
+            assert_eq!(names, ["p", "k", "k", "x", "y"], "{dialect} {from}");
+            let usages = column_usages(&format!("SELECT 1 FROM {from}"), &options).unwrap();
+            let keys: Vec<_> = usages
+                .iter()
+                .filter(|u| u.clause == Clause::JoinUsing)
+                .map(|u| (u.table.as_str(), u.column.as_str()))
+                .collect();
+            assert_eq!(keys, [("l", "k"), ("r", "k")], "{dialect} {from}");
+        }
+    }
+}
+
+#[test]
+fn starrocks_semi_and_anti_joins_read_both_sides_but_project_one() {
+    let options = Options::new()
+        .dialect(Dialect::STARROCKS)
+        .schema([("l", ["x", "k"]), ("r", ["y", "k"])]);
+    for (join, kept, hidden, value) in [
+        ("LEFT SEMI", "l", "r", "x"),
+        ("LEFT ANTI", "l", "r", "x"),
+        ("RIGHT SEMI", "r", "l", "y"),
+        ("RIGHT ANTI", "r", "l", "y"),
+    ] {
+        let sql = format!("SELECT * FROM l {join} JOIN r ON l.k = r.k");
+        assert_eq!(output_columns(&sql, &options).unwrap().unwrap(), [value, "k"], "{join}");
+        let origins = column_origins(&sql, &options).unwrap();
+        assert_eq!(origins[kept], ["k", value]);
+        assert!(origins[hidden].is_empty());
+        assert_eq!(referenced_columns(&sql, &options).unwrap()[hidden], ["k"]);
+        let key_sql = format!("SELECT k FROM l {join} JOIN r ON l.k = r.k");
+        assert!(column_origins(&key_sql, &options).unwrap()[hidden].is_empty());
+    }
+}
+
+#[test]
+fn structured_update_assignments_keep_targets_and_value_flow() {
+    let options = Options::new().dialect(Dialect::MYSQL).schema([
+        ("orders", vec!["id", "total", "note"]),
+        ("prices", vec!["id", "amount", "flag"]),
+    ]);
+    let sql = "UPDATE orders o JOIN prices p ON o.id = p.id SET o.total = p.amount, note = 'sale', flag = 1";
+    let usages = column_usages(sql, &options).unwrap();
+    let by_clause = |clause| {
+        usages
+            .iter()
+            .filter(|u| u.clause == clause)
+            .map(|u| (u.table.as_str(), u.column.as_str()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        by_clause(Clause::UpdateSetTarget),
+        [("orders", "note"), ("orders", "total"), ("prices", "flag")]
+    );
+    assert_eq!(by_clause(Clause::UpdateSetValue), [("prices", "amount")]);
+    assert_eq!(by_clause(Clause::JoinOn), [("orders", "id"), ("prices", "id")]);
+    let origins = column_origins(sql, &options).unwrap();
+    assert_eq!(origins["prices"], ["amount"]);
+    assert!(origins["orders"].is_empty());
+}
+
+#[test]
+fn update_target_with_a_quoted_dot_is_one_column() {
+    for (dialect, sql) in [
+        (Dialect::MYSQL, "UPDATE t SET `x.y` = v"),
+        (Dialect::STARROCKS, "UPDATE t SET `x.y` = v"),
+        (Dialect::TRINO, "UPDATE t SET \"x.y\" = v"),
+    ] {
+        let options = Options::new().dialect(dialect);
+        assert_eq!(
+            referenced_columns(sql, &options).unwrap()["t"],
+            ["v", "x.y"],
+            "{dialect}"
+        );
+    }
+}
+
+#[test]
+fn update_tuple_targets_are_bound_to_the_updated_relation() {
+    let sql = "UPDATE dst SET (a,b) = (src.x, src.y) FROM src WHERE dst.k = src.k";
+    let options = pg();
+    assert_eq!(referenced_columns(sql, &options).unwrap()["src"], ["k", "x", "y"]);
+    assert_eq!(referenced_columns(sql, &options).unwrap()["dst"], ["a", "b", "k"]);
+    assert_eq!(column_origins(sql, &options).unwrap()["src"], ["x", "y"]);
+}
+
+#[test]
+fn join_on_only_sees_the_operands_of_that_join() {
+    for dialect in [Dialect::MYSQL, Dialect::TRINO, Dialect::STARROCKS] {
+        let options = Options::new()
+            .dialect(dialect)
+            .schema([("prior", ["k"]), ("lhs", ["k"]), ("rhs", ["r"])]);
+        for from in [
+            "prior, lhs JOIN rhs ON k = rhs.r",
+            "prior CROSS JOIN (lhs JOIN rhs ON k = rhs.r)",
+        ] {
+            let sql = format!("SELECT 1 FROM {from}");
+            let refs = referenced_columns(&sql, &options).unwrap();
+            assert!(refs["prior"].is_empty(), "{dialect} {from}: {refs:?}");
+            assert_eq!(refs["lhs"], ["k"]);
+            assert_eq!(refs["rhs"], ["r"]);
+        }
+    }
+}
+
+#[test]
+fn using_outputs_follow_the_dialects_spelling_for_the_shared_key() {
+    for (dialect, join, expected) in [
+        (Dialect::TRINO, "LEFT", "key_id"),
+        (Dialect::TRINO, "FULL", "key_id"),
+        (Dialect::STARROCKS, "LEFT", "Key_Id"),
+        (Dialect::STARROCKS, "RIGHT", "KEY_ID"),
+        (Dialect::STARROCKS, "FULL", "key_id"),
+        (Dialect::MYSQL, "LEFT", "Key_Id"),
+        (Dialect::MYSQL, "RIGHT", "KEY_ID"),
+    ] {
+        let opts = Options::new()
+            .dialect(dialect)
+            .schema([("l", ["Key_Id"]), ("r", ["KEY_ID"])]);
+        let sql = format!("SELECT * FROM l {join} JOIN r USING (key_id)");
+        assert_eq!(
+            output_columns(&sql, &opts).unwrap().unwrap(),
+            [expected],
+            "{dialect} {join}"
         );
     }
 }

@@ -254,9 +254,9 @@ their arguments or by SQL text (ClickHouse `remote`/`cluster`/`merge`/`joinGet`,
 DuckDB `query_table`/`query`, Trino `TABLE(system.query(...))`, ...),
 ClickHouse `x IN t`, MySQL-family executable comments (`/*! ... */`),
 nested block comments that MySQL, BigQuery or Hive would end early, T-SQL
-table hints written without `WITH` (`t (NOLOCK)`), clause keywords the parser
-would take for a table alias (ClickHouse `a GLOBAL JOIN b`, Oracle
-`a PARTITION (p)`), and ClickHouse input the parser would silently skip.
+hints that parse as a function call or column aliases, clause keywords the parser
+would take for a table alias (ClickHouse `a GLOBAL JOIN b`, Doris
+`a PARTITIONS (p)`), and ClickHouse input the parser would silently skip.
 Rewrites also reject constructs the SQL generator would drop or cannot
 reproduce, such as Snowflake's `(+)` outer-join marker or BigQuery
 `CAST(x AS NUMERIC(10, 2))`, rather than change what the query means.

@@ -23,7 +23,7 @@ use polyglot_sql::{Expression, ExpressionWalk};
 
 use crate::ast::{ident_key, inner_query, is_query, qualified_name, table_names_match};
 use crate::column_usages::{Clause, ColumnUsage};
-use crate::options::Options;
+use crate::options::{Dialect, Options};
 use crate::schema::SchemaLookup;
 
 /// A `(root table, column)` pair.
@@ -80,6 +80,8 @@ enum Source<'a> {
     /// A relation whose columns are unknown and read no table directly: a
     /// table function, UNNEST or lateral view.
     Opaque,
+    /// A consumed SEMI/ANTI join operand. Its slot keeps nested join indices stable.
+    Hidden,
 }
 
 impl Source<'_> {
@@ -87,18 +89,72 @@ impl Source<'_> {
         match self {
             Source::Physical { table, .. } => vec![table.clone()],
             Source::Derived { roots, .. } => roots.clone(),
-            Source::Opaque => Vec::new(),
+            Source::Opaque | Source::Hidden => Vec::new(),
         }
     }
 }
 
-/// How a joined relation shares columns with the relations before it.
-#[derive(Clone)]
-enum SharedColumns {
-    /// `JOIN ... USING (k, ...)`.
-    Using(Vec<String>),
-    /// `NATURAL JOIN`: every column whose name is already present.
-    Natural,
+/// Source ranges belonging to the two operands of a USING or NATURAL join.
+/// Nested joins are registered before their enclosing join.
+struct SharedJoin<'a> {
+    left: usize,
+    right: usize,
+    end: usize,
+    join: &'a Join,
+}
+
+type StarColumn = (String, Vec<ColRef>);
+
+impl SharedJoin<'_> {
+    fn merge(&self, dialect: Dialect, mut left: Vec<StarColumn>, mut right: Vec<StarColumn>) -> Vec<StarColumn> {
+        // MySQL expands a RIGHT USING/NATURAL join as a reversed LEFT join.
+        if dialect == Dialect::MYSQL && matches!(self.join.kind, JoinKind::Right | JoinKind::NaturalRight) {
+            std::mem::swap(&mut left, &mut right);
+        }
+        let using: HashMap<_, _> = self
+            .join
+            .using
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.name.to_lowercase(), i))
+            .collect();
+        let mut left_keys = HashMap::new();
+        for (i, (name, _)) in left.iter().enumerate() {
+            let key = name.to_lowercase();
+            if name != "*" && (using.is_empty() || using.contains_key(&key)) {
+                left_keys.entry(key).or_insert(i);
+            }
+        }
+        let mut rank = vec![usize::MAX; left.len()];
+        right.retain_mut(|(name, refs)| {
+            let key = name.to_lowercase();
+            let Some(&i) = left_keys.get(&key) else { return true };
+            left[i].1.append(refs);
+            // MySQL takes shared columns in relation order. Trino and
+            // StarRocks take them in USING-list order.
+            rank[i] = i;
+            if let Some(&position) = using.get(&key) {
+                if dialect != Dialect::MYSQL {
+                    rank[i] = position;
+                }
+                match (dialect, self.join.kind) {
+                    (Dialect::TRINO, _) | (Dialect::STARROCKS, JoinKind::Full) => {
+                        left[i].0.clone_from(&self.join.using[position].name);
+                    }
+                    (Dialect::STARROCKS, JoinKind::Right) => left[i].0.clone_from(name),
+                    _ => {}
+                }
+            }
+            false
+        });
+        if matches!(dialect, Dialect::MYSQL | Dialect::TRINO | Dialect::STARROCKS) {
+            let mut ranked: Vec<_> = rank.into_iter().zip(left).collect();
+            ranked.sort_by_key(|(i, _)| *i);
+            left = ranked.into_iter().map(|(_, column)| column).collect();
+        }
+        left.extend(right);
+        left
+    }
 }
 
 struct CteEntry<'a> {
@@ -115,17 +171,12 @@ struct CteEntry<'a> {
 struct Scope<'a> {
     sources: RefCell<Vec<Rc<Source<'a>>>>,
     by_alias: RefCell<HashMap<String, Rc<Source<'a>>>>,
-    /// Source index -> the columns it shares with earlier sources, which an
-    /// unqualified `*` outputs once.
-    shared: RefCell<HashMap<usize, SharedColumns>>,
+    shared: RefCell<Vec<SharedJoin<'a>>>,
     ctes: HashMap<String, Rc<CteEntry<'a>>>,
     parent: Option<Rc<Scope<'a>>>,
     /// FROM-position wrappers (UNNEST, PIVOT arguments, table functions)
     /// collected once every relation of the scope is known.
     deferred: RefCell<Vec<&'a Expression>>,
-    /// Joins nested in FROM (`FROM (a JOIN b ON ...)`), whose conditions are
-    /// likewise collected once every relation is known.
-    deferred_joins: RefCell<Vec<&'a Join>>,
     windows: RefCell<HashMap<String, &'a Over>>,
     /// The body scope of a derived table in FROM, which cannot see the
     /// sibling relations of its parent scope.
@@ -139,6 +190,31 @@ impl<'a> Scope<'a> {
             self.by_alias.borrow_mut().insert(alias, source.clone());
         }
         self.sources.borrow_mut().push(source);
+    }
+
+    /// ON binds against this join's operands, even inside a comma list or a
+    /// parenthesized join. Correlated subqueries still see the enclosing query.
+    fn join_operands(self: &Rc<Self>, left: usize) -> Rc<Self> {
+        if left == 0 {
+            return self.clone();
+        }
+        let sources = self.sources.borrow()[left..].to_vec();
+        let visible: HashSet<_> = sources.iter().map(Rc::as_ptr).collect();
+        let aliases = self
+            .by_alias
+            .borrow()
+            .iter()
+            .filter(|(_, source)| visible.contains(&Rc::as_ptr(source)))
+            .map(|(alias, source)| (alias.clone(), source.clone()))
+            .collect();
+        Rc::new(Self {
+            sources: RefCell::new(sources),
+            by_alias: RefCell::new(aliases),
+            ctes: self.ctes.clone(),
+            parent: self.parent.clone(),
+            from_derived: self.from_derived,
+            ..Self::default()
+        })
     }
 
     fn matching_physical_tables(&self, qualifier: &str) -> Vec<Rc<Source<'a>>> {
@@ -186,8 +262,7 @@ impl<'a> Scope<'a> {
 
 pub(crate) struct Resolver<'a> {
     schema: SchemaLookup<'a>,
-    /// BigQuery: `FROM t, t.arr` reads a field of `t`, not a table.
-    correlated_paths: bool,
+    dialect: Dialect,
     flow_only: bool,
     /// Root table -> referenced columns. Every physical table that appears in
     /// a FROM is present, possibly with no columns.
@@ -305,7 +380,7 @@ impl<'a> Resolver<'a> {
     pub(crate) fn new(options: &'a Options, flow_only: bool, track_usages: bool) -> Self {
         Self {
             schema: SchemaLookup::new(&options.schema, options.dialect),
-            correlated_paths: options.dialect.correlates_paths(),
+            dialect: options.dialect,
             flow_only,
             result: BTreeMap::new(),
             usages: track_usages.then(BTreeSet::new),
@@ -553,28 +628,16 @@ impl<'a> Resolver<'a> {
             for window in select.windows.iter().flatten() {
                 scope.windows.borrow_mut().insert(ident_key(&window.name), &window.spec);
             }
+            let mut left = 0;
             for entry in select.from.iter().flat_map(|from| from.expressions.iter()) {
+                left = scope.sources.borrow().len();
                 self.add_source(entry, &scope);
             }
             for join in &select.joins {
-                let first = scope.sources.borrow().len();
-                self.add_source(&join.this, &scope);
-                let shared = if matches!(
-                    join.kind,
-                    JoinKind::Natural | JoinKind::NaturalLeft | JoinKind::NaturalRight | JoinKind::NaturalFull
-                ) {
-                    Some(SharedColumns::Natural)
-                } else if !join.using.is_empty() {
-                    Some(SharedColumns::Using(names(&join.using)))
-                } else {
-                    None
-                };
-                if let Some(shared) = shared {
-                    let added = scope.sources.borrow().len();
-                    for index in first..added {
-                        scope.shared.borrow_mut().insert(index, shared.clone());
-                    }
+                if join.kind == JoinKind::Implicit {
+                    left = scope.sources.borrow().len();
                 }
+                self.add_join(join, &scope, left);
             }
             if !select.lateral_views.is_empty() {
                 scope.push(None, Source::Opaque);
@@ -659,16 +722,6 @@ impl<'a> Resolver<'a> {
                     .flatten()
                 {
                     self.collect(expression, &scope, Clause::From, None);
-                }
-            }
-            for join in &select.joins {
-                if let Some(on) = &join.on {
-                    self.collect(on, &scope, Clause::JoinOn, None);
-                }
-                // USING (k) names a column shared by both sides.
-                for column in &join.using {
-                    let refs = self.resolve_unqualified(column, &scope);
-                    self.add_refs(&refs, Clause::JoinUsing);
                 }
             }
             out
@@ -790,6 +843,57 @@ impl<'a> Resolver<'a> {
     // Sources
     // -----------------------------------------------------------------------
 
+    fn add_join(&mut self, join: &'a Join, scope: &Rc<Scope<'a>>, left: usize) {
+        let right = scope.sources.borrow().len();
+        self.add_source(&join.this, scope);
+        let end = scope.sources.borrow().len();
+        if !self.flow_only {
+            if let Some(on) = &join.on {
+                self.collect(on, &scope.join_operands(left), Clause::JoinOn, None);
+            }
+        }
+        if !self.flow_only && !join.using.is_empty() {
+            let sources = scope.sources.borrow();
+            let operands = &sources[left..end];
+            for column in &join.using {
+                let refs = self.resolve_in_sources(column, operands).unwrap_or_else(|| {
+                    let roots = operands.iter().flat_map(|source| source.roots()).collect::<Vec<_>>();
+                    refs_for(&roots, &column.name)
+                });
+                self.add_refs(&refs, Clause::JoinUsing);
+            }
+        }
+        let hidden = match join.kind {
+            JoinKind::Semi | JoinKind::Anti | JoinKind::LeftSemi | JoinKind::LeftAnti => Some(right..end),
+            JoinKind::RightSemi | JoinKind::RightAnti => Some(left..right),
+            _ => None,
+        };
+        if let Some(hidden) = hidden {
+            if !self.flow_only {
+                self.collect_deferred(scope);
+            }
+            let mut sources = scope.sources.borrow_mut();
+            let hidden = &mut sources[hidden];
+            let aliases: HashSet<_> = hidden.iter().map(Rc::as_ptr).collect();
+            scope
+                .by_alias
+                .borrow_mut()
+                .retain(|_, source| !aliases.contains(&Rc::as_ptr(source)));
+            hidden.fill(Rc::new(Source::Hidden));
+            return;
+        }
+        if left < right
+            && right < end
+            && (!join.using.is_empty()
+                || matches!(
+                    join.kind,
+                    JoinKind::Natural | JoinKind::NaturalLeft | JoinKind::NaturalRight | JoinKind::NaturalFull
+                ))
+        {
+            scope.shared.borrow_mut().push(SharedJoin { left, right, end, join });
+        }
+    }
+
     fn add_source(&mut self, entry: &'a Expression, scope: &Rc<Scope<'a>>) {
         match entry {
             Expression::Table(table) => self.add_table(table, None, scope),
@@ -806,11 +910,11 @@ impl<'a> Resolver<'a> {
             }
             Expression::Paren(paren) => self.add_source(&paren.this, scope),
             Expression::JoinedTable(joined) => {
+                let left = scope.sources.borrow().len();
                 self.add_source(&joined.left, scope);
                 for join in &joined.joins {
-                    self.add_source(&join.this, scope);
+                    self.add_join(join, scope, left);
                 }
-                scope.deferred_joins.borrow_mut().extend(&joined.joins);
                 if !joined.lateral_views.is_empty() || joined.alias.is_some() {
                     scope.push(joined.alias.as_ref().map(ident_key), Source::Opaque);
                 }
@@ -891,7 +995,7 @@ impl<'a> Resolver<'a> {
             .filter(|alias| !alias.is_empty())
             .unwrap_or_else(|| name.clone());
 
-        if self.correlated_paths {
+        if self.dialect.correlates_paths() {
             // `FROM t, t.arr` / `FROM t, t.s.arr`: the first part names a
             // relation in scope, and the path reads its top-level column.
             let path = match (&table.catalog, &table.schema) {
@@ -947,16 +1051,6 @@ impl<'a> Resolver<'a> {
         let deferred = std::mem::take(&mut *scope.deferred.borrow_mut());
         for expression in deferred {
             self.collect(expression, scope, Clause::From, None);
-        }
-        let joins = std::mem::take(&mut *scope.deferred_joins.borrow_mut());
-        for join in joins {
-            if let Some(on) = &join.on {
-                self.collect(on, scope, Clause::JoinOn, None);
-            }
-            for column in &join.using {
-                let refs = self.resolve_unqualified(column, scope);
-                self.add_refs(&refs, Clause::JoinUsing);
-            }
         }
     }
 
@@ -1059,37 +1153,36 @@ impl<'a> Resolver<'a> {
                 None => out.push(("*".to_owned(), vec![(table.clone(), "*".to_owned())])),
             },
             Source::Opaque => out.push(("*".to_owned(), Vec::new())),
+            Source::Hidden => {}
         };
 
         if qualifier.is_empty() {
-            let shared = scope.shared.borrow();
-            for (index, source) in scope.sources.borrow().iter().enumerate() {
-                let Some(shared) = shared.get(&index) else {
+            let shared_joins = scope.shared.borrow();
+            if shared_joins.is_empty() {
+                for source in scope.sources.borrow().iter() {
                     emit(source, &mut out);
-                    continue;
-                };
-                let mut columns = Vec::new();
-                emit(source, &mut columns);
-                for (name, refs) in columns {
-                    let is_shared = name != "*"
-                        && match shared {
-                            SharedColumns::Using(using) => {
-                                using.iter().any(|column| column.eq_ignore_ascii_case(&name))
-                            }
-                            SharedColumns::Natural => true,
-                        };
-                    // A shared column is output once; its value may come from
-                    // either side.
-                    match out
-                        .iter_mut()
-                        .find(|(existing, _)| is_shared && existing.eq_ignore_ascii_case(&name))
-                    {
-                        Some((_, existing)) => existing.extend(refs),
-                        None => out.push((name, refs)),
-                    }
                 }
+                return out;
             }
-            return out;
+            let mut groups: Vec<_> = scope
+                .sources
+                .borrow()
+                .iter()
+                .map(|source| {
+                    let mut columns = Vec::new();
+                    emit(source, &mut columns);
+                    columns
+                })
+                .collect();
+            // Fold each pair of operands into its first slot. Empty slots
+            // preserve the source indices of joins still to be processed.
+            for shared in shared_joins.iter() {
+                let collect = |groups: &mut [Vec<StarColumn>]| groups.iter_mut().flat_map(std::mem::take).collect();
+                let left = collect(&mut groups[shared.left..shared.right]);
+                let right = collect(&mut groups[shared.right..shared.end]);
+                groups[shared.left] = shared.merge(self.dialect, left, right);
+            }
+            return groups.into_iter().flatten().collect();
         }
         // The qualifier may name a relation of an enclosing scope (a
         // correlated `t.*` inside a subquery).
@@ -1280,7 +1373,7 @@ impl<'a> Resolver<'a> {
                     // star) is attributed to the derived source's roots.
                     Source::Derived { out, roots } => out.refs(name).cloned().unwrap_or_else(|| refs_for(roots, name)),
                     // Never registered under an alias; fail open regardless.
-                    Source::Opaque => refs_for(&scope.chain_roots(), name),
+                    Source::Opaque | Source::Hidden => refs_for(&scope.chain_roots(), name),
                 };
             }
             let matched = level.matching_physical_tables(qualifier);
@@ -1304,13 +1397,30 @@ impl<'a> Resolver<'a> {
         if name.is_empty() {
             return Vec::new();
         }
+        if let Some(refs) = self.resolve_in_sources(column, &scope.sources.borrow()) {
+            return refs;
+        }
+        // Every current source is fully known and none has the name: SQL
+        // correlation resolves it against enclosing scopes.
+        if let Some(parent) = &scope.parent {
+            let found = self.resolve_unqualified(column, parent);
+            if !found.is_empty() {
+                return found;
+            }
+        }
+        refs_for(&scope.roots(), name)
+    }
+
+    /// Some(empty) means the name binds to a derived value without source columns.
+    fn resolve_in_sources(&self, column: &Identifier, sources: &[Rc<Source<'a>>]) -> Option<Vec<ColRef>> {
+        let name = column.name.as_str();
         let mut refs = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
         // Whether some source exposes the name. A derived column computed
         // without column inputs (`count(*) AS n`) has no refs but still binds
         // the name, so it must not fall through to the fallbacks below.
         let mut bound = false;
-        for source in scope.sources.borrow().iter() {
+        for source in sources {
             match source.as_ref() {
                 Source::Derived { out, roots } => {
                     if let Some(found) = out.refs(name) {
@@ -1330,7 +1440,7 @@ impl<'a> Resolver<'a> {
                     None => unknown.push(table.clone()),
                 },
                 // Columns of table functions are not attributed to tables.
-                Source::Opaque => {}
+                Source::Opaque | Source::Hidden => {}
             }
         }
         let mut distinct: Vec<String> = Vec::new();
@@ -1340,18 +1450,7 @@ impl<'a> Resolver<'a> {
             }
         }
         refs.extend(refs_for(&distinct, name));
-        if bound || !refs.is_empty() {
-            return refs;
-        }
-        // Every current source is fully known and none has the name: SQL
-        // correlation resolves it against enclosing scopes.
-        if let Some(parent) = &scope.parent {
-            let found = self.resolve_unqualified(column, parent);
-            if !found.is_empty() {
-                return found;
-            }
-        }
-        refs_for(&scope.roots(), name)
+        (bound || !refs.is_empty()).then_some(refs)
     }
 
     // -----------------------------------------------------------------------
@@ -1415,21 +1514,42 @@ impl<'a> Resolver<'a> {
     fn resolve_update(&mut self, update: &'a Update, parent: Option<&Rc<Scope<'a>>>) -> Rc<Output> {
         let scope = self.update_sources(update, parent);
         self.collect_deferred(&scope);
-        let target = qualified_name(&update.table);
-        let target_alias = update_target_is_alias(update).then(|| ident_key(&update.table.name));
-        for (column, value) in &update.set {
-            // Some dialects store a qualified target `t.x` as one identifier.
-            match (column.name.rsplit_once('.'), &target_alias) {
-                (Some((qualifier, name)), _) => {
-                    let refs = Self::resolve_qualified(&qualifier.to_lowercase(), name, &scope);
-                    self.add_refs(&refs, Clause::UpdateSetTarget);
-                }
-                (None, Some(alias)) => {
-                    let refs = Self::resolve_qualified(alias, &column.name, &scope);
-                    self.add_refs(&refs, Clause::UpdateSetTarget);
-                }
-                (None, None) => self.add(&target, &column.name, Clause::UpdateSetTarget),
+        // A simple SET list carries identifiers. When any target is qualified
+        // or structured, Polyglot stores the entire list in assignments.
+        let multi_table =
+            self.dialect == Dialect::MYSQL && (!update.table_joins.is_empty() || !update.extra_tables.is_empty());
+        let alias = update_target_is_alias(update).then(|| ident_key(&update.table.name));
+        let target_table = qualified_name(&update.table);
+        let record_name = |this: &mut Self, name: &Identifier| {
+            if multi_table {
+                let refs = this.resolve_unqualified(name, &scope);
+                this.add_refs(&refs, Clause::UpdateSetTarget);
+            } else if let Some(alias) = &alias {
+                let refs = Self::resolve_qualified(alias, &name.name, &scope);
+                this.add_refs(&refs, Clause::UpdateSetTarget);
+            } else {
+                this.add(&target_table, &name.name, Clause::UpdateSetTarget);
             }
+        };
+        for (name, _) in &update.set {
+            record_name(self, name);
+        }
+        for assignment in &update.assignments {
+            let mut targets = vec![&assignment.left];
+            while let Some(target) = targets.pop() {
+                match target {
+                    Expression::Column(column) if column.table.is_none() => record_name(self, &column.name),
+                    Expression::Identifier(name) => record_name(self, name),
+                    Expression::Tuple(tuple) => targets.extend(&tuple.expressions),
+                    Expression::Subscript(subscript) => {
+                        targets.push(&subscript.this);
+                        self.collect(&subscript.index, &scope, Clause::UpdateSetValue, None);
+                    }
+                    _ => self.collect(target, &scope, Clause::UpdateSetTarget, None),
+                }
+            }
+        }
+        for value in update_values(update) {
             self.collect(value, &scope, Clause::UpdateSetValue, None);
         }
         if let Some(clause) = &update.where_clause {
@@ -1504,7 +1624,7 @@ impl<'a> Resolver<'a> {
     /// Value flow of `UPDATE ... SET`: only assigned values count.
     pub(crate) fn update_value_flow(&mut self, update: &'a Update) {
         let scope = self.update_sources(update, None);
-        for (_, value) in &update.set {
+        for value in update_values(update) {
             let refs = self.collect_refs(value, &scope, Clause::UpdateSetValue);
             self.record_flow(&refs);
         }
@@ -1519,6 +1639,14 @@ impl<'a> Resolver<'a> {
             self.record_flow(&refs);
         }
     }
+}
+
+fn update_values(update: &Update) -> impl Iterator<Item = &Expression> {
+    update
+        .set
+        .iter()
+        .map(|(_, value)| value)
+        .chain(update.assignments.iter().map(|assignment| &assignment.right))
 }
 
 /// T-SQL `UPDATE x SET ... FROM t AS x`: the target names a FROM relation by

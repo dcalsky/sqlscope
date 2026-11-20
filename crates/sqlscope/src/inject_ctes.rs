@@ -77,7 +77,7 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
         }
     }
 
-    let prepared = prepare_rewrite(sql, dialect);
+    let prepared = prepare_rewrite(sql, dialect)?;
     let mut consumer = ast::parse_query(&prepared, dialect).map_err(|error| error.context("query"))?;
     let slot = query_with_mut(&mut consumer).ok_or_else(|| Error::internal("query has no WITH slot"))?;
     if let Some(existing) = slot {
@@ -111,7 +111,7 @@ pub fn inject_ctes(sql: &str, ctes: &[CteDef], options: &Options) -> Result<Stri
     let mut inputs: Vec<std::borrow::Cow<'_, str>> = vec![prepared.clone()];
     for (index, cte) in ctes.iter().enumerate() {
         let name = cte.name.trim();
-        let text = prepare_rewrite(&cte.query, dialect);
+        let text = prepare_rewrite(&cte.query, dialect).map_err(|error| error.context(format!("CTE {name:?}")))?;
         let query = ast::parse_query(&text, dialect).map_err(|error| error.context(format!("CTE {name:?}")))?;
         inputs.push(text);
         if recursive {

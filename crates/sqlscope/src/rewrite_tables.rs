@@ -174,7 +174,7 @@ pub fn rewrite_tables(sql: &str, rewrites: &[TableRewrite], options: &Options) -
         .filter(|catalog| !catalog.is_empty())
         .collect();
 
-    let normalized = prepare_rewrite(sql, dialect);
+    let normalized = prepare_rewrite(sql, dialect)?;
     let statement = ast::parse_query(&normalized, dialect)?;
     let rewritten = rewrite_statement(statement, dialect, |table| {
         let key = match_key(table, &transparent)?;

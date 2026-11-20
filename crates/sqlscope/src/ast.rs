@@ -48,6 +48,11 @@ fn parse_options() -> ParseOptions {
     }
 }
 
+pub(crate) fn guard_comments(sql: &str, dialect: Dialect) -> Result<()> {
+    guard_executable_comments(sql, dialect)?;
+    guard_nested_comments(sql, dialect)
+}
+
 /// MySQL-compatible servers execute the body of `/*! ... */` (and MariaDB's
 /// `/*M! ... */`) as SQL, depending on the server version, while the parser
 /// reads a comment. Analysis would miss the hidden code, so such input is
@@ -261,10 +266,8 @@ const TSQL_TABLE_HINTS: &[&str] = &[
     "spatial_window_max_cells",
 ];
 
-/// T-SQL accepts table hints without `WITH`, which the parser reads as
-/// something else: `FROM t (NOLOCK)` as a call of a function `t` (hiding the
-/// table), `FROM t AS x (NOLOCK)` as column aliases (renaming a column once
-/// the table is wrapped). Both are rejected; `WITH (NOLOCK)` parses.
+/// Polyglot represents recognized T-SQL hints on the table itself, with or
+/// without WITH. Reject ambiguous leftovers parsed as a function or an alias list.
 fn guard_legacy_table_hints(statement: &Expression, dialect: Dialect) -> Result<()> {
     fn hint(argument: &Expression) -> bool {
         let name = match argument {
@@ -567,8 +570,7 @@ fn is_type_or_keyword(word: &str) -> bool {
 }
 
 /// Clause keywords the parser reads as an implicit table alias in these
-/// dialects: ClickHouse `a GLOBAL JOIN b` and `a PASTE JOIN b`, Oracle
-/// `a PARTITION (p)` (which also turns `p` into a column alias), Doris
+/// dialects, such as ClickHouse `a GLOBAL JOIN b` and `a PASTE JOIN b` or Doris
 /// `a PARTITIONS (p)`. The result means something else than the input.
 fn guard_keyword_aliases(statement: &Expression, dialect: Dialect) -> Result<()> {
     use polyglot_sql::DialectType::{ClickHouse, Doris, Oracle};
@@ -598,8 +600,7 @@ fn guard_keyword_aliases(statement: &Expression, dialect: Dialect) -> Result<()>
 pub(crate) fn parse(sql: &str, dialect: Dialect) -> Result<Vec<Expression>> {
     guard_input(sql)?;
     guard_unbalanced_parentheses(sql, dialect)?;
-    guard_executable_comments(sql, dialect)?;
-    guard_nested_comments(sql, dialect)?;
+    guard_comments(sql, dialect)?;
     let statements: Vec<Expression> = parse_raw(sql, dialect)??
         .into_iter()
         .map(|statement| fold_table_aliases(statement, dialect))
