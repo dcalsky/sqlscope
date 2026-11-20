@@ -50,7 +50,7 @@ pub(crate) fn normalize(sql: &str, dialect: Dialect) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn byte_offsets(sql: &str) -> Vec<usize> {
+pub(crate) fn byte_offsets(sql: &str) -> Vec<usize> {
     sql.char_indices().map(|(at, _)| at).chain([sql.len()]).collect()
 }
 

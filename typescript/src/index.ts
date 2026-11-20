@@ -3,6 +3,7 @@
  *
  * | Function | Purpose |
  * | --- | --- |
+ * | {@link transpile} | Convert Trino SQL to StarRocks or MySQL. |
  * | {@link applyRowFilter} | Filter every in-scope table by a predicate. |
  * | {@link injectCtes} | Prepend CTE definitions to a query's root `WITH`. |
  * | {@link rewriteTables} | Replace table references with other tables or derived tables. |

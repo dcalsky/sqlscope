@@ -18,6 +18,10 @@
  *    "tablePatterns", "defaultDb", "stripCatalogs"}}
  *
  * where TableRef is {"table", "schema", "catalog"}; only "sql" is required.
+ * The transpile operation takes {"sql":"...", "source":"trino", "target":"starrocks",
+ * "mode":"strict"} and returns an array of statements. Targets are starrocks
+ * and mysql. Optional mode is strict (default) or best_effort.
+ *
  * All functions are safe to call concurrently from any thread.
  */
 #ifndef SQLSCOPE_H

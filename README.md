@@ -5,6 +5,7 @@ Scope-aware SQL analysis and rewriting for Rust, Python, Go and TypeScript, buil
 
 | Operation | Purpose |
 | --- | --- |
+| `transpile` | Convert Trino SQL to StarRocks or MySQL. |
 | `apply_row_filter` | Filter every in-scope table by a predicate (row-level security). |
 | `inject_ctes` | Prepend CTE definitions to a query's root `WITH`. |
 | `rewrite_tables` | Replace table references with other tables or derived tables. |
@@ -13,7 +14,7 @@ Scope-aware SQL analysis and rewriting for Rust, Python, Go and TypeScript, buil
 | `referenced_columns` | Columns referenced anywhere (filters included), per table. |
 | `column_usages` | Column references together with the clause they appear in. |
 
-Everything works on the parsed AST, never by splicing SQL text, and resolves
+The analysis and scoped rewriting operations work on the parsed AST and resolve
 names with SQL scoping rules: CTE shadowing, correlated subqueries, set
 operations, derived tables, `USING`, `PIVOT`, `UNNEST`, lateral views.
 
@@ -131,12 +132,11 @@ listed in the README inside each release archive.
 
 ## Options
 
-Every operation takes the same options. Settings an operation does not read
-are ignored.
+Analysis and scoped rewriting operations share the following options.
 
 | Rust (`Options::`) | Python keyword | Go | TypeScript option | Read by |
 | --- | --- | --- | --- | --- |
-| `dialect` | `dialect` | `WithDialect` | `dialect` | all (default `trino`) |
+| `dialect` | `dialect` | `WithDialect` | `dialect` | analysis and scoped rewriting (default `trino`) |
 | `schema` | `schema` | `WithSchema` | `schema` | `column_origins`, `output_columns`, `referenced_columns`, `column_usages` |
 | `table_names` | `table_names` | `WithTableNames` | `tableNames` | `apply_row_filter` |
 | `table_patterns` | `table_patterns` | `WithTableRegexp` | `tablePatterns` | `apply_row_filter` |
@@ -158,6 +158,26 @@ In BigQuery a quoted path such as `` `proj.ds.orders` `` is read as
 `` `proj`.`ds`.`orders` `` by every operation.
 
 ## Operations
+
+### `transpile(sql, source, target, mode)`
+
+Convert a Trino expression, query or script into one SQL string per statement.
+The source is currently `trino`. The target is `starrocks` or `mysql`. Python, TypeScript and the JSON API default
+to `strict`. Rust and Go take an explicit mode. Strict mode reports recognized
+unsupported conversions. Best-effort mode permits SQLGlot-style lossy fallbacks.
+
+```python
+sqlscope.transpile("SELECT ARRAY[1, 2]; TABLE orders", "trino", "starrocks")
+# ["SELECT [1, 2]", "SELECT * FROM orders"]
+```
+
+The checked-in corpus compares output text and error classes with SQLGlot
+v30.33.0. A match can still produce different values on the target database.
+For example, SQLGlot emits `SELECT 3 / 2` for MySQL even though Trino truncates
+integer division. See the [corpus and reproduction instructions](tools/sqlglot/README.md).
+
+The [Calcite regression corpus](tools/calcite/README.md) covers the Trino
+renderings in Apache Calcite 1.42.0's relational-to-SQL converter tests.
 
 ### `apply_row_filter(sql, predicate)`
 
@@ -243,12 +263,12 @@ TypeScript functions are camelCase (`applyRowFilter`, `columnOrigins`, ...)
 and every error extends `SqlscopeError`.
 
 Input is limited to 1 MiB and 256 levels of parser nesting on every platform.
-Rewrites regenerate SQL from the AST (normalized formatting, comments
+Scoped rewrites regenerate SQL from the AST (normalized formatting, comments
 removed, optimizer hints kept) and verify that the output parses before
 returning it; when nothing needs rewriting, the input is returned unchanged.
 
-Every operation fails closed (`Unsupported`) on input whose tables it cannot
-see or scope: data-modifying CTEs in a rewritten query, `IDENTIFIER(...)`,
+Analysis and scoped rewriting operations return `Unsupported` on input whose tables they cannot
+see or scope, including data-modifying CTEs in a rewritten query, `IDENTIFIER(...)`,
 Snowflake table literals (`TABLE('t')`), functions that read tables named by
 their arguments or by SQL text (ClickHouse `remote`/`cluster`/`merge`/`joinGet`,
 DuckDB `query_table`/`query`, Trino `TABLE(system.query(...))`, ...),

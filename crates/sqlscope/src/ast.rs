@@ -388,7 +388,7 @@ fn without_panics<R>(what: &str, f: impl FnOnce() -> R) -> Result<R> {
 
 /// The parser on its own: the outer result reports a parser panic, the inner
 /// one the parse.
-fn parse_raw(sql: &str, dialect: Dialect) -> Result<Result<Vec<Expression>>> {
+pub(crate) fn parse_raw(sql: &str, dialect: Dialect) -> Result<Result<Vec<Expression>>> {
     without_panics("SQL parser", || {
         polyglot_sql::parse_with_options(sql, dialect.polyglot(), &parse_options()).map_err(classify_parse_error)
     })

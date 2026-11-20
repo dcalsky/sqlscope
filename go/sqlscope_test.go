@@ -448,3 +448,10 @@ func TestReferencedColumnsTrinoSchemaCase(t *testing.T) {
 		})
 	}
 }
+
+func TestTranspile(t *testing.T) {
+	got, err := sqlscope.Transpile("SELECT ARRAY[1]; TABLE t", "trino", "starrocks", sqlscope.Strict)
+	if err != nil || !reflect.DeepEqual(got, []string{"SELECT [1]", "SELECT * FROM t"}) {
+		t.Fatalf("Transpile: %v, %v", got, err)
+	}
+}

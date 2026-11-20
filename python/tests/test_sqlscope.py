@@ -186,3 +186,31 @@ def test_returning_usage():
     assert ColumnUsage("t", "payload", Clause.RETURNING) in sqlscope.column_usages(
         "DELETE FROM t WHERE id = 1 RETURNING payload", dialect="postgres"
     )
+
+
+def test_transpile():
+    assert sqlscope.transpile("SELECT ARRAY[1]; TABLE t", "trino", "starrocks") == ["SELECT [1]", "SELECT * FROM t"]
+    with pytest.raises(sqlscope.UnsupportedError):
+        sqlscope.transpile("SELECT ARRAY[1]", "trino", "mysql")
+    assert sqlscope.transpile("SELECT ARRAY[1]", "trino", "mysql", mode="best_effort") == ["SELECT ARRAY(1)"]
+
+
+def test_transpile_rejects_unsupported_source():
+    with pytest.raises(sqlscope.InvalidArgumentError):
+        sqlscope.transpile("SELECT 1", "mysql", "starrocks")
+
+
+def test_calcite_offset_limit_result():
+    """Apache Calcite 1.42.0 core/src/test/resources/sql/sort.iq, scott-lenient."""
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(":memory:")) as db:
+        db.execute("CREATE TABLE dept(deptno INTEGER, dname TEXT, loc TEXT)")
+        db.executemany("INSERT INTO dept VALUES (?, ?, ?)", [
+            (30, "SALES", "CHICAGO"), (10, "ACCOUNTING", "NEW YORK"),
+            (40, "OPERATIONS", "BOSTON"), (20, "RESEARCH", "DALLAS"),
+        ])
+        for target in ("mysql", "starrocks"):
+            query, = sqlscope.transpile("select * from dept order by deptno offset 1 limit 2", "trino", target)
+            assert db.execute(query).fetchall() == [(20, "RESEARCH", "DALLAS"), (30, "SALES", "CHICAGO")]

@@ -1,0 +1,354 @@
+{
+  "revision": "c01f6b5519d4a906cf41bbe7843f5929662cf5fd",
+  "cases": [
+    {
+      "test": "testPiFunction",
+      "input": "SELECT PI()\nFROM (VALUES (0)) AS \"t\" (\"ZERO\")",
+      "calcite": {
+        "mysql": "SELECT PI()"
+      },
+      "sqlglot": {
+        "starrocks": "SELECT PI() FROM (SELECT 0 AS `ZERO`) AS `t`"
+      },
+      "reviewed": {
+        "mysql": "SELECT PI() FROM (SELECT 0 AS `ZERO`) AS `t`"
+      }
+    },
+    {
+      "test": "testPiFunctionWithoutParentheses",
+      "input": "SELECT PI() AS \"PI\"\nFROM (VALUES (0)) AS \"t\" (\"ZERO\")",
+      "calcite": {
+        "mysql": "SELECT PI() AS `PI`"
+      },
+      "sqlglot": {
+        "starrocks": "SELECT PI() AS `PI` FROM (SELECT 0 AS `ZERO`) AS `t`"
+      },
+      "reviewed": {
+        "mysql": "SELECT PI() AS `PI` FROM (SELECT 0 AS `ZERO`) AS `t`"
+      }
+    },
+    {
+      "test": "testSelectQueryWithGroupByEmpty",
+      "input": "SELECT COUNT(*)\nFROM \"foodmart\".\"product\"",
+      "calcite": {
+        "mysql": "SELECT COUNT(*)\nFROM `foodmart`.`product`",
+        "starrocks": "SELECT COUNT(*)\nFROM `foodmart`.`product`"
+      },
+      "sqlglot": {},
+      "reviewed": {}
+    },
+    {
+      "test": "testSelectQueryWithGroupByEmpty",
+      "input": "SELECT COUNT(*)\nFROM \"foodmart\".\"product\"",
+      "calcite": {
+        "mysql": "SELECT COUNT(*)\nFROM `foodmart`.`product`",
+        "starrocks": "SELECT COUNT(*)\nFROM `foodmart`.`product`"
+      },
+      "sqlglot": {},
+      "reviewed": {}
+    },
+    {
+      "test": "testSelectLiteralAgg",
+      "input": "SELECT \"DEPTNO\", 2 AS \"two\"\nFROM \"scott\".\"EMP\"\nGROUP BY \"DEPTNO\"",
+      "calcite": {
+        "mysql": "SELECT `DEPTNO`, 2 AS `two`\nFROM `scott`.`EMP`\nGROUP BY `DEPTNO`"
+      },
+      "sqlglot": {
+        "starrocks": "SELECT `DEPTNO`, 2 AS `two` FROM `scott`.`EMP` GROUP BY `DEPTNO`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testSelectQueryWithSingletonCube",
+      "input": "SELECT \"product_class_id\", COUNT(*) AS \"C\"\nFROM \"foodmart\".\"product\"\nGROUP BY ROLLUP(\"product_class_id\")\nORDER BY \"product_class_id\", 2",
+      "calcite": {
+        "mysql": "SELECT `product_class_id`, COUNT(*) AS `C`\nFROM `foodmart`.`product`\nGROUP BY `product_class_id` WITH ROLLUP\nORDER BY `product_class_id` IS NULL, `product_class_id`, COUNT(*) IS NULL, 2",
+        "starrocks": "SELECT `product_class_id`, COUNT(*) AS `C`\nFROM `foodmart`.`product`\nGROUP BY ROLLUP(`product_class_id`)\nORDER BY `product_class_id` IS NULL, `product_class_id`, COUNT(*) IS NULL, 2"
+      },
+      "sqlglot": {},
+      "reviewed": {
+        "mysql": "SELECT `product_class_id`, COUNT(*) AS `C`\nFROM `foodmart`.`product`\nGROUP BY `product_class_id` WITH ROLLUP\nORDER BY CASE WHEN `product_class_id` IS NULL THEN 1 ELSE 0 END, `product_class_id`, CASE WHEN COUNT(*) IS NULL THEN 1 ELSE 0 END, 2",
+        "starrocks": "SELECT `product_class_id`, COUNT(*) AS `C`\nFROM `foodmart`.`product`\nGROUP BY ROLLUP(`product_class_id`)\nORDER BY CASE WHEN `product_class_id` IS NULL THEN 1 ELSE 0 END, `product_class_id`, CASE WHEN COUNT(*) IS NULL THEN 1 ELSE 0 END, 2"
+      }
+    },
+    {
+      "test": "testSelectQueryWithSingletonCubeNoOrderBy",
+      "input": "SELECT \"product_class_id\", COUNT(*) AS \"C\"\nFROM \"foodmart\".\"product\"\nGROUP BY ROLLUP(\"product_class_id\")",
+      "calcite": {
+        "mysql": "SELECT `product_class_id`, COUNT(*) AS `C`\nFROM `foodmart`.`product`\nGROUP BY `product_class_id` WITH ROLLUP",
+        "starrocks": "SELECT `product_class_id`, COUNT(*) AS `C`\nFROM `foodmart`.`product`\nGROUP BY ROLLUP(`product_class_id`)"
+      },
+      "sqlglot": {},
+      "reviewed": {}
+    },
+    {
+      "test": "testSelectQueryWithCubeLimit",
+      "input": "SELECT \"product_class_id\", COUNT(*) AS \"C\"\nFROM \"foodmart\".\"product\"\nGROUP BY ROLLUP(\"product_class_id\")\nFETCH NEXT 5 ROWS ONLY",
+      "calcite": {
+        "mysql": "SELECT `product_class_id`, COUNT(*) AS `C`\nFROM `foodmart`.`product`\nGROUP BY `product_class_id` WITH ROLLUP\nLIMIT 5",
+        "starrocks": "SELECT `product_class_id`, COUNT(*) AS `C`\nFROM `foodmart`.`product`\nGROUP BY ROLLUP(`product_class_id`)\nLIMIT 5"
+      },
+      "sqlglot": {},
+      "reviewed": {}
+    },
+    {
+      "test": "testOrderByOrdinalWithExpression",
+      "input": "SELECT \"product_id\", COUNT(*) AS \"c\"\nFROM \"foodmart\".\"product\"\nGROUP BY \"product_id\"\nORDER BY 2",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": null,
+        "starrocks": null
+      },
+      "reviewed": {
+        "mysql": "SELECT `product_id`, COUNT(*) AS `c` FROM `foodmart`.`product` GROUP BY `product_id` ORDER BY CASE WHEN COUNT(*) IS NULL THEN 1 ELSE 0 END, 2",
+        "starrocks": "SELECT `product_id`, COUNT(*) AS `c` FROM `foodmart`.`product` GROUP BY `product_id` ORDER BY CASE WHEN COUNT(*) IS NULL THEN 1 ELSE 0 END, 2"
+      }
+    },
+    {
+      "test": "testCastToTimestampWithoutPrecision",
+      "input": "SELECT *\nFROM \"foodmart\".\"employee\"\nWHERE (\"hire_date\" - INTERVAL '19800' SECOND) > CAST(\"hire_date\" AS TIMESTAMP)",
+      "calcite": {
+        "starrocks": "SELECT *\nFROM `foodmart`.`employee`\nWHERE (`hire_date` - INTERVAL '19800' SECOND) > CAST(`hire_date` AS DATETIME)"
+      },
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`employee` WHERE (`hire_date` - INTERVAL '19800' SECOND) > CAST(`hire_date` AS DATETIME)"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testSelectQueryWithLimitClause",
+      "input": "SELECT \"product_id\"\nFROM \"foodmart\".\"product\"\nOFFSET 10 ROWS\nFETCH NEXT 100 ROWS ONLY",
+      "calcite": {
+        "starrocks": "SELECT `product_id`\nFROM `foodmart`.`product`\nLIMIT 100\nOFFSET 10"
+      },
+      "sqlglot": {
+        "mysql": "SELECT `product_id` FROM `foodmart`.`product` LIMIT 100 OFFSET 10"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testSelectQueryWithLimitClauseWithoutOrder",
+      "input": "SELECT \"product_id\"\nFROM \"foodmart\".\"product\"\nOFFSET 10 ROWS\nFETCH NEXT 100 ROWS ONLY",
+      "calcite": {
+        "starrocks": "SELECT `product_id`\nFROM `foodmart`.`product`\nLIMIT 100\nOFFSET 10"
+      },
+      "sqlglot": {
+        "mysql": "SELECT `product_id` FROM `foodmart`.`product` LIMIT 100 OFFSET 10"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testFloor",
+      "input": "SELECT DATE_TRUNC('MINUTE', \"hire_date\")\nFROM \"foodmart\".\"employee\"",
+      "calcite": {
+        "starrocks": "SELECT DATE_TRUNC('MINUTE', `hire_date`)\nFROM `foodmart`.`employee`"
+      },
+      "sqlglot": {
+        "mysql": "SELECT DATE_ADD('0000-01-01 00:00:00', INTERVAL (TIMESTAMPDIFF(MINUTE, '0000-01-01 00:00:00', `hire_date`)) MINUTE) FROM `foodmart`.`employee`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testFetchOffset",
+      "input": "SELECT *\nFROM \"foodmart\".\"employee\"\nOFFSET 1 ROWS\nFETCH NEXT 1 ROWS ONLY",
+      "calcite": {
+        "starrocks": "SELECT *\nFROM `foodmart`.`employee`\nLIMIT 1\nOFFSET 1"
+      },
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`employee` LIMIT 1 OFFSET 1"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testSubstring",
+      "input": "SELECT SUBSTRING(\"brand_name\", 2)\nFROM \"foodmart\".\"product\"",
+      "calcite": {
+        "mysql": "SELECT SUBSTRING(`brand_name`, 2)\nFROM `foodmart`.`product`",
+        "starrocks": "SELECT SUBSTRING(`brand_name`, 2)\nFROM `foodmart`.`product`"
+      },
+      "sqlglot": {},
+      "reviewed": {}
+    },
+    {
+      "test": "testSubstringWithFor",
+      "input": "SELECT SUBSTRING(\"brand_name\", 2, 3)\nFROM \"foodmart\".\"product\"",
+      "calcite": {
+        "mysql": "SELECT SUBSTRING(`brand_name`, 2, 3)\nFROM `foodmart`.`product`",
+        "starrocks": "SELECT SUBSTRING(`brand_name`, 2, 3)\nFROM `foodmart`.`product`"
+      },
+      "sqlglot": {},
+      "reviewed": {}
+    },
+    {
+      "test": "testPrestoSqlLength",
+      "input": "SELECT LENGTH(\"brand_name\")\nFROM \"foodmart\".\"product\"",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT CHAR_LENGTH(`brand_name`) FROM `foodmart`.`product`",
+        "starrocks": "SELECT CHAR_LENGTH(`brand_name`) FROM `foodmart`.`product`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testCubeWithGroupBy",
+      "input": "SELECT COUNT(*)\nFROM \"foodmart\".\"product\"\nGROUP BY CUBE(\"product_id\", \"product_class_id\")",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT COUNT(*) FROM `foodmart`.`product` GROUP BY CUBE (`product_id`, `product_class_id`)",
+        "starrocks": "SELECT COUNT(*) FROM `foodmart`.`product` GROUP BY CUBE (`product_id`, `product_class_id`)"
+      },
+      "reviewed": {
+        "mysql": null
+      }
+    },
+    {
+      "test": "testRollupWithGroupBy",
+      "input": "SELECT COUNT(*)\nFROM \"foodmart\".\"product\"\nGROUP BY ROLLUP(\"product_id\", \"product_class_id\")",
+      "calcite": {
+        "starrocks": "SELECT COUNT(*)\nFROM `foodmart`.`product`\nGROUP BY ROLLUP(`product_id`, `product_class_id`)"
+      },
+      "sqlglot": {
+        "mysql": "SELECT COUNT(*) FROM `foodmart`.`product` GROUP BY ROLLUP (`product_id`, `product_class_id`)"
+      },
+      "reviewed": {
+        "mysql": "SELECT COUNT(*) FROM `foodmart`.`product` GROUP BY `product_id`, `product_class_id` WITH ROLLUP"
+      }
+    },
+    {
+      "test": "testImplicitTypeCoercion",
+      "input": "SELECT \"employee_id\"\nFROM \"foodmart\".\"employee\"\nWHERE 10 = CAST('10' AS INTEGER) AND \"birth_date\" = CAST('1914-02-02' AS DATE) OR \"hire_date\" = CAST('1996-01-01 ' || '00:00:00' AS TIMESTAMP)",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT `employee_id` FROM `foodmart`.`employee` WHERE 10 = CAST('10' AS SIGNED) AND `birth_date` = CAST('1914-02-02' AS DATE) OR `hire_date` = CAST(CONCAT('1996-01-01 ', '00:00:00') AS DATETIME)",
+        "starrocks": "SELECT `employee_id` FROM `foodmart`.`employee` WHERE 10 = CAST('10' AS INT) AND `birth_date` = CAST('1914-02-02' AS DATE) OR `hire_date` = CAST(CONCAT('1996-01-01 ', '00:00:00') AS DATETIME)"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testSelectApproxCountDistinct",
+      "input": "SELECT APPROX_DISTINCT(\"product_id\")\nFROM \"foodmart\".\"product\"",
+      "calcite": {
+        "starrocks": "SELECT APPROX_COUNT_DISTINCT(`product_id`)\nFROM `foodmart`.`product`"
+      },
+      "sqlglot": {
+        "mysql": "SELECT APPROX_DISTINCT(`product_id`) FROM `foodmart`.`product`"
+      },
+      "reviewed": {
+        "mysql": null
+      }
+    },
+    {
+      "test": "testNullCollation",
+      "input": "SELECT *\nFROM \"foodmart\".\"product\"\nORDER BY \"brand_name\"",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`product` ORDER BY CASE WHEN `brand_name` IS NULL THEN 1 ELSE 0 END, `brand_name`",
+        "starrocks": "SELECT * FROM `foodmart`.`product` ORDER BY CASE WHEN `brand_name` IS NULL THEN 1 ELSE 0 END, `brand_name`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testNullCollationAsc",
+      "input": "SELECT *\nFROM \"foodmart\".\"product\"\nORDER BY \"brand_name\"",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`product` ORDER BY CASE WHEN `brand_name` IS NULL THEN 1 ELSE 0 END, `brand_name`",
+        "starrocks": "SELECT * FROM `foodmart`.`product` ORDER BY CASE WHEN `brand_name` IS NULL THEN 1 ELSE 0 END, `brand_name`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testNullCollationAscNullLast",
+      "input": "SELECT *\nFROM \"foodmart\".\"product\"\nORDER BY \"brand_name\"",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`product` ORDER BY CASE WHEN `brand_name` IS NULL THEN 1 ELSE 0 END, `brand_name`",
+        "starrocks": "SELECT * FROM `foodmart`.`product` ORDER BY CASE WHEN `brand_name` IS NULL THEN 1 ELSE 0 END, `brand_name`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testNullCollationAscNullFirst",
+      "input": "SELECT *\nFROM \"foodmart\".\"product\"\nORDER BY \"brand_name\" IS NULL DESC, \"brand_name\"",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`product` ORDER BY `brand_name` IS NULL DESC, CASE WHEN `brand_name` IS NULL THEN 1 ELSE 0 END, `brand_name`",
+        "starrocks": "SELECT * FROM `foodmart`.`product` ORDER BY `brand_name` IS NULL DESC, CASE WHEN `brand_name` IS NULL THEN 1 ELSE 0 END, `brand_name`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testNullCollationDesc",
+      "input": "SELECT *\nFROM \"foodmart\".\"product\"\nORDER BY \"brand_name\" IS NULL DESC, \"brand_name\" DESC",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`product` ORDER BY `brand_name` IS NULL DESC, `brand_name` DESC",
+        "starrocks": "SELECT * FROM `foodmart`.`product` ORDER BY `brand_name` IS NULL DESC, `brand_name` DESC"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testNullCollationDescLast",
+      "input": "SELECT *\nFROM \"foodmart\".\"product\"\nORDER BY \"brand_name\" DESC",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`product` ORDER BY `brand_name` DESC",
+        "starrocks": "SELECT * FROM `foodmart`.`product` ORDER BY `brand_name` DESC"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testNullCollationDescFirst",
+      "input": "SELECT *\nFROM \"foodmart\".\"product\"\nORDER BY \"brand_name\" IS NULL DESC, \"brand_name\" DESC",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT * FROM `foodmart`.`product` ORDER BY `brand_name` IS NULL DESC, `brand_name` DESC",
+        "starrocks": "SELECT * FROM `foodmart`.`product` ORDER BY `brand_name` IS NULL DESC, `brand_name` DESC"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testMapValueConstructor",
+      "input": "SELECT MAP (ARRAY['k1', 'k2'], ARRAY['v1', 'v2'])\nFROM (VALUES (0)) AS \"t\" (\"ZERO\")",
+      "calcite": {
+        "starrocks": "SELECT MAP { 'k1' : 'v1', 'k2' : 'v2' }"
+      },
+      "sqlglot": {
+        "mysql": null
+      },
+      "reviewed": {
+        "starrocks": "SELECT MAP('k1', 'v1', 'k2', 'v2') FROM (SELECT 0 AS `ZERO`) AS `t`"
+      }
+    },
+    {
+      "test": "testMapValueConstructorWithArray",
+      "input": "SELECT MAP (ARRAY['k1', 'k2'], ARRAY['v1', 'v2'])\nFROM (VALUES (0)) AS \"t\" (\"ZERO\")",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": null,
+        "starrocks": "SELECT MAP('k1', 'v1', 'k2', 'v2') FROM (SELECT 0 AS `ZERO`) AS `t`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testPrestoBinaryCast",
+      "input": "SELECT CAST(CAST(\"employee_id\" AS VARCHAR) AS VARBINARY)\nFROM \"foodmart\".\"reserve_employee\"",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT CAST(CAST(`employee_id` AS CHAR) AS VARBINARY) FROM `foodmart`.`reserve_employee`",
+        "starrocks": "SELECT CAST(CAST(`employee_id` AS VARCHAR) AS VARBINARY) FROM `foodmart`.`reserve_employee`"
+      },
+      "reviewed": {}
+    },
+    {
+      "test": "testPrestoFloatingPointTypesCast",
+      "input": "SELECT CAST(\"department_id\" AS DOUBLE), CAST(\"department_id\" AS DOUBLE), CAST(\"department_id\" AS REAL)\nFROM \"foodmart\".\"employee\"",
+      "calcite": {},
+      "sqlglot": {
+        "mysql": "SELECT CAST(`department_id` AS DOUBLE), CAST(`department_id` AS DOUBLE), CAST(`department_id` AS FLOAT) FROM `foodmart`.`employee`",
+        "starrocks": "SELECT CAST(`department_id` AS DOUBLE), CAST(`department_id` AS DOUBLE), CAST(`department_id` AS FLOAT) FROM `foodmart`.`employee`"
+      },
+      "reviewed": {}
+    }
+  ]
+}

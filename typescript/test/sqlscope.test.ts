@@ -170,3 +170,9 @@ test("RETURNING usage", () => {
   assert.ok(sqlscope.columnUsages("DELETE FROM t WHERE id = 1 RETURNING payload", { dialect: "postgres" })
     .some((usage) => usage.table === "t" && usage.column === "payload" && usage.clause === "RETURNING"));
 });
+
+test("transpile", () => {
+  assert.deepEqual(sqlscope.transpile("SELECT ARRAY[1]; TABLE t", "trino", "starrocks"), ["SELECT [1]", "SELECT * FROM t"]);
+  assert.throws(() => sqlscope.transpile("SELECT ARRAY[1]", "trino", "mysql"), sqlscope.UnsupportedError);
+  assert.deepEqual(sqlscope.transpile("SELECT ARRAY[1]", "trino", "mysql", "best_effort"), ["SELECT ARRAY(1)"]);
+});

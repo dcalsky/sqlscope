@@ -138,6 +138,16 @@ function run(operation: string, sql: string, fields: object, options: object): u
   return call(operation, { sql, ...fields, options });
 }
 
+/** Convert Trino SQL and return one string per statement. */
+export function transpile(
+  sql: string,
+  source: "trino",
+  target: "starrocks" | "mysql",
+  mode: "strict" | "best_effort" = "strict",
+): string[] {
+  return call("transpile", { sql, source, target, mode }) as string[];
+}
+
 /**
  * Wrap every in-scope table of a query in a derived table filtered by `predicate`.
  *

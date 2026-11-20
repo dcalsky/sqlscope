@@ -1,5 +1,6 @@
 // Package sqlscope analyzes and rewrites SQL with scope awareness.
 //
+//	Transpile      convert Trino SQL to StarRocks or MySQL
 //	ApplyRowFilter      filter every in-scope table by a predicate
 //	InjectCTEs          prepend CTE definitions to a query's root WITH
 //	RewriteTables       replace table references with other tables or derived tables
@@ -8,8 +9,7 @@
 //	ReferencedColumns   columns referenced anywhere, per table
 //	ColumnUsages        column references with the clause they appear in
 //
-// Every function takes the same functional [Option]s; options that do not
-// apply to a function are ignored.
+// Analysis and scoped rewriting functions share the functional [Option]s.
 //
 // The SQL engine is the sqlscope FFI shared library (libsqlscope_ffi.so,
 // libsqlscope_ffi.dylib or sqlscope_ffi.dll) published with each sqlscope
