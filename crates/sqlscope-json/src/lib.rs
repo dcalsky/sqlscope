@@ -115,13 +115,48 @@ pub fn invalid(message: String) -> Value {
     json!({"error": {"kind": "invalid_argument", "message": message}})
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum ConversionMode {
+    #[default]
+    Strict,
+    BestEffort,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranspileRequest {
+    sql: String,
+    source: String,
+    target: String,
+    #[serde(default)]
+    mode: ConversionMode,
+}
+
+fn convert(request: TranspileRequest) -> Result<Value, Error> {
+    let mode = match request.mode {
+        ConversionMode::Strict => sqlscope::TranspileMode::Strict,
+        ConversionMode::BestEffort => sqlscope::TranspileMode::BestEffort,
+    };
+    to_value(sqlscope::transpile(
+        &request.sql,
+        request.source.parse()?,
+        request.target.parse()?,
+        mode,
+    )?)
+}
+
 /// Executes one request and returns the JSON response.
 pub fn execute(operation: &str, request: &[u8]) -> Value {
-    let request: Request = match serde_json::from_slice(request) {
-        Ok(request) => request,
+    let parsed = if operation == "transpile" {
+        serde_json::from_slice(request).map(convert)
+    } else {
+        serde_json::from_slice(request).map(|request| dispatch(operation, request))
+    };
+    let result = match parsed {
+        Ok(result) => result,
         Err(error) => return invalid(format!("invalid request: {error}")),
     };
-    let result = dispatch(operation, request);
     match result {
         Ok(value) => json!({ "ok": value }),
         Err(error) => json!({"error": {"kind": kind(error.kind()), "message": error.message()}}),
@@ -220,6 +255,21 @@ fn invalid_error(message: String) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transpile_requires_explicit_supported_dialects() {
+        for request in [
+            r#"{"sql":"SELECT 1","target":"mysql"}"#,
+            r#"{"sql":"SELECT 1","source":"trino"}"#,
+            r#"{"sql":"SELECT 1","source":"mysql","target":"starrocks"}"#,
+            r#"{"sql":"SELECT 1","source":"trino","target":"trino"}"#,
+        ] {
+            assert_eq!(
+                execute("transpile", request.as_bytes())["error"]["kind"],
+                "invalid_argument"
+            );
+        }
+    }
 
     #[test]
     fn executes_requests() {

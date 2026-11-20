@@ -77,6 +77,21 @@ func run[T any](operation string, fields map[string]any, opts []Option) (T, erro
 	return out, err
 }
 
+// TranspileMode controls handling of recognized unsupported Trino constructs.
+type TranspileMode string
+
+const (
+	Strict     TranspileMode = "strict"
+	BestEffort TranspileMode = "best_effort"
+)
+
+// Transpile converts Trino SQL to starrocks or mysql, returning one string per statement.
+func Transpile(sql, source, target string, mode TranspileMode) ([]string, error) {
+	var statements []string
+	err := invoke("transpile", map[string]any{"sql": sql, "source": source, "target": target, "mode": mode}, &statements)
+	return statements, err
+}
+
 // ApplyRowFilter wraps every in-scope physical table of a query in a derived
 // table filtered by predicate:
 //

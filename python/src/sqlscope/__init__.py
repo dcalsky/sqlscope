@@ -3,6 +3,7 @@
 =====================  ==========================================================
 Function               Purpose
 =====================  ==========================================================
+transpile              Convert Trino SQL to StarRocks or MySQL.
 apply_row_filter       Filter every in-scope table by a predicate.
 inject_ctes            Prepend CTE definitions to a query's root ``WITH``.
 rewrite_tables         Replace table references with other tables or derived tables.
@@ -12,7 +13,7 @@ referenced_columns     Columns referenced anywhere, per table.
 column_usages          Column references with the clause they appear in.
 =====================  ==========================================================
 
-Every function accepts ``dialect`` (default ``"trino"``). Functions release the
+Analysis and scoped rewriting functions accept ``dialect`` (default ``"trino"``). Functions release the
 GIL while they run and are safe to call from several threads.
 
 The SQL engine is the sqlscope FFI shared library (``libsqlscope_ffi.so``,
@@ -41,7 +42,7 @@ from ._library import (
     load,
 )
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"
 
 __all__ = [
     "Clause",
@@ -68,6 +69,7 @@ __all__ = [
     "output_columns",
     "referenced_columns",
     "rewrite_tables",
+    "transpile",
 ]
 
 Schema = Mapping[str, Sequence[str]]
@@ -176,6 +178,15 @@ def _run(operation: str, sql: str, *, dialect: Optional[str], **fields: Any) -> 
         options[name] = fields.pop(name, None)
     request = {"sql": sql, **fields, "options": {k: v for k, v in options.items() if v is not None}}
     return call(operation, request)
+
+
+def transpile(sql: str, source: str, target: str, *, mode: str = "strict") -> List[str]:
+    """Convert Trino SQL to starrocks or mysql. Each statement yields one string.
+
+    Use mode="best_effort" to allow lossy conversions for unsupported features.
+    """
+    statements: List[str] = call("transpile", {"sql": sql, "source": source, "target": target, "mode": mode})
+    return statements
 
 
 def apply_row_filter(
