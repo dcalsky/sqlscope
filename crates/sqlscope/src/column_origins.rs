@@ -84,3 +84,53 @@ fn query_origins(statement: &Expression, query: &Expression, options: &Options) 
     }
     origins
 }
+
+/// One projected column and its root source columns, grouped by physical table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputColumnLineage {
+    pub name: String,
+    pub sources: BTreeMap<String, Vec<String>>,
+}
+
+/// Traces the value of each output of a SELECT, set operation or query-bearing
+/// statement. Entries follow projection order, including duplicate names.
+/// A literal has empty sources. Unknown wildcard expansions retain `*`.
+/// Returns `None` for statements without a source query.
+pub fn output_lineage(sql: &str, options: &Options) -> Result<Option<Vec<OutputColumnLineage>>> {
+    let dialect = options.dialect;
+    let statement = ast::parse_single(&normalize(sql, dialect), dialect)?;
+    let Some(query) = ast::inner_query(&statement) else {
+        return Ok(None);
+    };
+    let mut resolver = Resolver::new(options, true, false);
+    let out = resolver.resolve_root(query);
+    let declared = crate::output_columns::declared_columns(&statement, options)?;
+    if resolver.ambiguous_positions
+        || declared
+            .as_ref()
+            .is_some_and(|names| names.len() != out.names.len() || !out.wildcards.is_empty())
+    {
+        return Err(crate::Error::unsupported("cannot align output columns by position; check the column counts and provide schemas for wildcard projections"));
+    }
+    let names = declared.as_ref().unwrap_or(&out.names);
+    let mut lineage = Vec::with_capacity(names.len());
+    for (index, (name, refs)) in names.iter().zip(&out.positions).enumerate() {
+        let name = if name.is_empty() {
+            format!("_col{index}")
+        } else {
+            name.clone()
+        };
+        let mut sources = BTreeMap::<String, Vec<String>>::new();
+        for (table, column) in refs {
+            if resolver.result.contains_key(table) {
+                sources.entry(table.clone()).or_default().push(column.clone());
+            }
+        }
+        for columns in sources.values_mut() {
+            columns.sort_unstable();
+            columns.dedup();
+        }
+        lineage.push(OutputColumnLineage { name, sources });
+    }
+    Ok(Some(lineage))
+}

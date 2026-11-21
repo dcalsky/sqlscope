@@ -214,3 +214,11 @@ def test_calcite_offset_limit_result():
         for target in ("mysql", "starrocks"):
             query, = sqlscope.transpile("select * from dept order by deptno offset 1 limit 2", "trino", target)
             assert db.execute(query).fetchall() == [(20, "RESEARCH", "DALLAS"), (30, "SALES", "CHICAGO")]
+
+
+def test_output_lineage():
+    sql = "WITH v AS (SELECT price, qty FROM orders) SELECT price AS unit_price, price * qty AS total FROM v"
+    assert sqlscope.output_lineage(sql) == [
+        sqlscope.OutputColumnLineage("unit_price", {"orders": ["price"]}),
+        sqlscope.OutputColumnLineage("total", {"orders": ["price", "qty"]}),
+    ]

@@ -232,6 +232,21 @@ fn dispatch(operation: &str, request: Request) -> Result<Value, Error> {
             to_value(sqlscope::rewrite_tables(&sql, &plan, &options)?)
         }
         "column_origins" => to_value(sqlscope::column_origins(&sql, &options)?),
+        "output_lineage" => {
+            let lineage = sqlscope::output_lineage(&sql, &options)?;
+            Ok(lineage.map_or(Value::Null, |columns| {
+                Value::Array(
+                    columns
+                        .into_iter()
+                        .map(|column| {
+                            json!({
+                                "name": column.name, "sources": column.sources
+                            })
+                        })
+                        .collect(),
+                )
+            }))
+        }
         "output_columns" => to_value(sqlscope::output_columns(&sql, &options)?),
         "referenced_columns" => to_value(sqlscope::referenced_columns(&sql, &options)?),
         "column_usages" => to_value(
@@ -280,6 +295,11 @@ mod tests {
         assert_eq!(
             response,
             json!({"ok": "SELECT id FROM (SELECT * FROM orders WHERE t = 1) AS orders"})
+        );
+
+        assert_eq!(
+            execute("output_lineage", br#"{"sql":"SELECT id AS a, 1 AS a FROM orders"}"#),
+            json!({"ok":[{"name":"a","sources":{"orders":["id"]}},{"name":"a","sources":{}}]})
         );
 
         let response = execute("column_usages", br#"{"sql": "SELECT a FROM t WHERE b > 1"}"#);

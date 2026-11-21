@@ -42,14 +42,6 @@ pub fn output_columns(sql: &str, options: &Options) -> Result<Option<Vec<String>
     let dialect = options.dialect;
     let statement = ast::parse_single(&normalize(sql, dialect), dialect)?;
 
-    if let Expression::Insert(insert) = &statement {
-        if !insert.columns.is_empty() {
-            return Ok(Some(names(insert.columns.iter().map(|c| c.name.as_str()))));
-        }
-        if !insert.values.is_empty() || insert.default_values {
-            return Err(Error::unsupported("INSERT without a target column list"));
-        }
-    }
     if let Some(columns) = declared_columns(&statement, options)? {
         return Ok(Some(columns));
     }
@@ -63,10 +55,18 @@ fn names<'n>(names: impl Iterator<Item = &'n str>) -> Vec<String> {
     names.filter(|name| !name.is_empty()).map(str::to_owned).collect()
 }
 
-/// Columns declared by DDL: an explicit view / CTAS column list, or the
-/// column definitions and LIKE clauses of CREATE TABLE.
-fn declared_columns(statement: &Expression, options: &Options) -> Result<Option<Vec<String>>> {
+/// Explicit output names on an INSERT, view, or table definition.
+pub(crate) fn declared_columns(statement: &Expression, options: &Options) -> Result<Option<Vec<String>>> {
     match statement {
+        Expression::Insert(insert) => {
+            if !insert.columns.is_empty() {
+                return Ok(Some(names(insert.columns.iter().map(|c| c.name.as_str()))));
+            }
+            if !insert.values.is_empty() || insert.default_values {
+                return Err(Error::unsupported("INSERT without a target column list"));
+            }
+            Ok(None)
+        }
         Expression::CreateView(view) if !view.columns.is_empty() => {
             Ok(Some(names(view.columns.iter().map(|c| c.name.name.as_str()))))
         }

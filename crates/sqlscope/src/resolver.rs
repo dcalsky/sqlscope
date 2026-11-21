@@ -36,6 +36,8 @@ pub(crate) struct Output {
     pub(crate) names: Vec<String>,
     pub(crate) by_name: HashMap<String, Vec<ColRef>>,
     pub(crate) positions: Vec<Vec<ColRef>>,
+    /// Positions occupied by stars whose expansion width is unknown.
+    pub(crate) wildcards: BTreeSet<usize>,
     /// For a SELECT (or a set operation, from its left branch): how many
     /// positions each projection item produced, in order. A star produces
     /// one per expanded column.
@@ -103,7 +105,8 @@ struct SharedJoin<'a> {
     join: &'a Join,
 }
 
-type StarColumn = (String, Vec<ColRef>);
+/// A missing name denotes an unexpanded wildcard.
+type StarColumn = (Option<String>, Vec<ColRef>);
 
 impl SharedJoin<'_> {
     fn merge(&self, dialect: Dialect, mut left: Vec<StarColumn>, mut right: Vec<StarColumn>) -> Vec<StarColumn> {
@@ -120,13 +123,15 @@ impl SharedJoin<'_> {
             .collect();
         let mut left_keys = HashMap::new();
         for (i, (name, _)) in left.iter().enumerate() {
+            let Some(name) = name else { continue };
             let key = name.to_lowercase();
-            if name != "*" && (using.is_empty() || using.contains_key(&key)) {
+            if using.is_empty() || using.contains_key(&key) {
                 left_keys.entry(key).or_insert(i);
             }
         }
         let mut rank = vec![usize::MAX; left.len()];
         right.retain_mut(|(name, refs)| {
+            let Some(name) = name else { return true };
             let key = name.to_lowercase();
             let Some(&i) = left_keys.get(&key) else { return true };
             left[i].1.append(refs);
@@ -139,9 +144,9 @@ impl SharedJoin<'_> {
                 }
                 match (dialect, self.join.kind) {
                     (Dialect::TRINO, _) | (Dialect::STARROCKS, JoinKind::Full) => {
-                        left[i].0.clone_from(&self.join.using[position].name);
+                        left[i].0 = Some(self.join.using[position].name.clone());
                     }
-                    (Dialect::STARROCKS, JoinKind::Right) => left[i].0.clone_from(name),
+                    (Dialect::STARROCKS, JoinKind::Right) => left[i].0 = Some(name.clone()),
                     _ => {}
                 }
             }
@@ -264,6 +269,8 @@ pub(crate) struct Resolver<'a> {
     schema: SchemaLookup<'a>,
     dialect: Dialect,
     flow_only: bool,
+    /// Some projected values cannot be aligned with aliases or set-operation branches.
+    pub(crate) ambiguous_positions: bool,
     /// Root table -> referenced columns. Every physical table that appears in
     /// a FROM is present, possibly with no columns.
     pub(crate) result: BTreeMap<String, BTreeSet<String>>,
@@ -291,28 +298,6 @@ fn refs_for(roots: &[String], name: &str) -> Vec<ColRef> {
     roots.iter().map(|root| (root.clone(), name.to_owned())).collect()
 }
 
-fn apply_column_aliases(out: Rc<Output>, aliases: &[String]) -> Rc<Output> {
-    if aliases.is_empty() {
-        return out;
-    }
-    let mut renamed = Output::default();
-    for index in 0..out.positions.len().max(aliases.len()) {
-        let alias = aliases
-            .get(index)
-            .or_else(|| out.names.get(index))
-            .cloned()
-            .unwrap_or_default();
-        let refs = out
-            .positions
-            .get(index)
-            .cloned()
-            .or_else(|| out.names.get(index).and_then(|name| out.refs(name)).cloned())
-            .unwrap_or_default();
-        renamed.add(alias, refs);
-    }
-    Rc::new(renamed)
-}
-
 fn names(identifiers: &[Identifier]) -> Vec<String> {
     identifiers
         .iter()
@@ -332,40 +317,6 @@ fn ordinal(expression: &Expression) -> Option<usize> {
     }
 }
 
-/// `(column, qualifier)` of a dotted reference: `a.b.c.d` -> (`d`, `a.b.c`).
-fn dot_parts(expression: &Expression) -> Option<(String, String)> {
-    fn segments(expression: &Expression, out: &mut Vec<String>) -> bool {
-        match expression {
-            Expression::Dot(dot) => {
-                if !segments(&dot.this, out) {
-                    return false;
-                }
-                out.push(ident_key(&dot.field));
-                true
-            }
-            Expression::Column(column) => {
-                if let Some(table) = &column.table {
-                    out.push(ident_key(table));
-                }
-                out.push(column.name.name.clone());
-                true
-            }
-            _ => false,
-        }
-    }
-    let mut parts = Vec::new();
-    if !segments(expression, &mut parts) || parts.is_empty() {
-        return None;
-    }
-    let column = match expression {
-        Expression::Dot(dot) => dot.field.name.clone(),
-        Expression::Column(column) => column.name.name.clone(),
-        _ => return None,
-    };
-    parts.pop()?;
-    Some((column, parts.join(".")))
-}
-
 /// Unwraps a query that is parenthesized or an unaliased subquery.
 fn as_query(expression: &Expression) -> Option<&Expression> {
     match expression {
@@ -382,6 +333,7 @@ impl<'a> Resolver<'a> {
             schema: SchemaLookup::new(&options.schema, options.dialect),
             dialect: options.dialect,
             flow_only,
+            ambiguous_positions: false,
             result: BTreeMap::new(),
             usages: track_usages.then(BTreeSet::new),
             entries: Vec::new(),
@@ -474,6 +426,34 @@ impl<'a> Resolver<'a> {
         })
     }
 
+    fn apply_column_aliases(&mut self, out: Rc<Output>, aliases: &[String]) -> Rc<Output> {
+        if aliases.is_empty() {
+            return out;
+        }
+        if out.wildcards.first().is_some_and(|&index| index < aliases.len()) {
+            self.ambiguous_positions = true;
+        }
+        let mut renamed = Output {
+            wildcards: out.wildcards.clone(),
+            ..Output::default()
+        };
+        for index in 0..out.positions.len().max(aliases.len()) {
+            let alias = aliases
+                .get(index)
+                .or_else(|| out.names.get(index))
+                .cloned()
+                .unwrap_or_default();
+            let refs = out
+                .positions
+                .get(index)
+                .cloned()
+                .or_else(|| out.names.get(index).and_then(|name| out.refs(name)).cloned())
+                .unwrap_or_default();
+            renamed.add(alias, refs);
+        }
+        Rc::new(renamed)
+    }
+
     fn resolve_cte(&mut self, entry: &Rc<CteEntry<'a>>) -> Rc<Output> {
         if let Some(memo) = entry.memo.borrow().as_ref() {
             return memo.clone();
@@ -484,7 +464,7 @@ impl<'a> Resolver<'a> {
         entry.resolving.set(true);
         let parent = entry.parent.borrow().clone();
         let out = self.resolve_query(entry.query, parent.as_ref());
-        let out = apply_column_aliases(out, &entry.column_aliases);
+        let out = self.apply_column_aliases(out, &entry.column_aliases);
         entry.resolving.set(false);
         *entry.memo.borrow_mut() = Some(out.clone());
         out
@@ -784,7 +764,11 @@ impl<'a> Resolver<'a> {
         let include_right = !self.flow_only || right_values_flow;
 
         let mut out = Output::default();
-        if by_name || corresponding || !on_columns.is_empty() {
+        let match_names = by_name || corresponding || !on_columns.is_empty();
+        if (include_right || match_names) && (!left.wildcards.is_empty() || !right.wildcards.is_empty()) {
+            self.ambiguous_positions = true;
+        }
+        if match_names {
             let names = if !on_columns.is_empty() {
                 on_columns
                     .iter()
@@ -818,6 +802,10 @@ impl<'a> Resolver<'a> {
                 out.items.push(1);
             }
         } else {
+            if include_right && left.names.len() != right.names.len() {
+                self.ambiguous_positions = true;
+            }
+            out.wildcards.clone_from(&left.wildcards);
             out.items = left.items.clone();
             for (index, name) in left.names.iter().enumerate() {
                 let mut refs = left.positions.get(index).cloned().unwrap_or_default();
@@ -974,7 +962,7 @@ impl<'a> Resolver<'a> {
         self.entering_derived = true;
         let out = self.resolve_query(&subquery.this, Some(scope));
         self.entering_derived = false;
-        let out = apply_column_aliases(out, &names(column_aliases));
+        let out = self.apply_column_aliases(out, &names(column_aliases));
         let roots = out.roots();
         scope.push(alias.map(ident_key), Source::Derived { out, roots });
     }
@@ -1015,7 +1003,7 @@ impl<'a> Resolver<'a> {
         if unqualified {
             if let Some(entry) = scope.ctes.get(&name).cloned() {
                 let out = self.resolve_cte(&entry);
-                let out = apply_column_aliases(out, &names(&table.column_aliases));
+                let out = self.apply_column_aliases(out, &names(&table.column_aliases));
                 let roots = out.roots();
                 scope.push(Some(alias), Source::Derived { out, roots });
                 return;
@@ -1037,10 +1025,11 @@ impl<'a> Resolver<'a> {
                     for column in &table.column_aliases {
                         out.add(column.name.clone(), vec![(root.clone(), "*".into())]);
                     }
+                    out.wildcards.insert(out.positions.len());
                     out.add("*".into(), vec![(root.clone(), "*".into())]);
                 }
             }
-            let out = apply_column_aliases(Rc::new(out), &names(&table.column_aliases));
+            let out = self.apply_column_aliases(Rc::new(out), &names(&table.column_aliases));
             scope.push(Some(alias), Source::Derived { out, roots: vec![root] });
         } else {
             scope.push(Some(alias), Source::Physical { table: root, columns });
@@ -1065,6 +1054,10 @@ impl<'a> Resolver<'a> {
             match item {
                 Expression::Star(star) => {
                     for (name, refs) in self.expand_star(star, scope, Clause::Select) {
+                        let name = name.unwrap_or_else(|| {
+                            out.wildcards.insert(out.positions.len());
+                            "*".into()
+                        });
                         out.add(name, refs);
                     }
                 }
@@ -1076,9 +1069,9 @@ impl<'a> Resolver<'a> {
                     let refs = self.collect_refs(item, scope, Clause::Select);
                     out.add(column.name.name.clone(), refs);
                 }
-                Expression::Dot(_) => {
+                Expression::Dot(dot) => {
                     let refs = self.collect_refs(item, scope, Clause::Select);
-                    out.add(dot_parts(item).map(|(column, _)| column).unwrap_or_default(), refs);
+                    out.add(dot.field.name.clone(), refs);
                 }
                 _ => {
                     // An unaliased expression has an engine-defined name. In
@@ -1096,17 +1089,18 @@ impl<'a> Resolver<'a> {
     /// Expands `*` / `t.*` into `(name, refs)` pairs, applying the star's
     /// EXCEPT / EXCLUDE, REPLACE and RENAME modifiers. An unknown relation
     /// yields the `*` sentinel.
-    fn expand_star(&mut self, star: &'a Star, scope: &Rc<Scope<'a>>, clause: Clause) -> Vec<(String, Vec<ColRef>)> {
+    fn expand_star(&mut self, star: &'a Star, scope: &Rc<Scope<'a>>, clause: Clause) -> Vec<StarColumn> {
         let mut columns = self.star_columns(star, scope);
-        let matches = |identifier: &Identifier, name: &str| {
+        let matches = |identifier: &Identifier, name: &Option<String>| {
+            let Some(name) = name else { return false };
             if identifier.quoted {
-                identifier.name == name
+                identifier.name == *name
             } else {
                 identifier.name.eq_ignore_ascii_case(name)
             }
         };
         if let Some(except) = &star.except {
-            columns.retain(|(name, _)| name == "*" || !except.iter().any(|excluded| matches(excluded, name)));
+            columns.retain(|(name, _)| !except.iter().any(|excluded| matches(excluded, name)));
         }
         let mut replaced = vec![false; columns.len()];
         for replacement in star.replace.iter().flatten() {
@@ -1114,8 +1108,8 @@ impl<'a> Resolver<'a> {
             if let Some(index) = columns.iter().position(|(name, _)| matches(&replacement.alias, name)) {
                 columns[index].1 = refs;
                 replaced[index] = true;
-            } else if columns.iter().any(|(name, _)| name == "*") {
-                columns.push((replacement.alias.name.clone(), refs));
+            } else if columns.iter().any(|(name, _)| name.is_none()) {
+                columns.push((Some(replacement.alias.name.clone()), refs));
                 replaced.push(true);
             }
         }
@@ -1126,33 +1120,33 @@ impl<'a> Resolver<'a> {
         }
         for (from, to) in star.rename.iter().flatten() {
             if let Some(column) = columns.iter_mut().find(|(name, _)| matches(from, name)) {
-                column.0 = to.name.clone();
+                column.0 = Some(to.name.clone());
             }
         }
         columns
     }
 
     /// The unmodified columns a star stands for, without recording them.
-    fn star_columns(&self, star: &Star, scope: &Rc<Scope<'a>>) -> Vec<(String, Vec<ColRef>)> {
+    fn star_columns(&self, star: &Star, scope: &Rc<Scope<'a>>) -> Vec<StarColumn> {
         let mut out = Vec::new();
         let qualifier = star.table.as_ref().map(ident_key).unwrap_or_default();
 
-        let emit = |source: &Source, out: &mut Vec<(String, Vec<ColRef>)>| match source {
+        let emit = |source: &Source, out: &mut Vec<StarColumn>| match source {
             Source::Derived { out: derived, .. } => {
                 for (index, name) in derived.names.iter().enumerate() {
                     let refs = derived.positions.get(index).cloned().unwrap_or_default();
-                    out.push((name.clone(), refs));
+                    out.push(((!derived.wildcards.contains(&index)).then(|| name.clone()), refs));
                 }
             }
             Source::Physical { table, columns } => match columns {
                 Some(columns) => {
                     for column in columns.iter().cloned() {
-                        out.push((column.clone(), vec![(table.clone(), column)]));
+                        out.push((Some(column.clone()), vec![(table.clone(), column)]));
                     }
                 }
-                None => out.push(("*".to_owned(), vec![(table.clone(), "*".to_owned())])),
+                None => out.push((None, vec![(table.clone(), "*".to_owned())])),
             },
-            Source::Opaque => out.push(("*".to_owned(), Vec::new())),
+            Source::Opaque => out.push((None, Vec::new())),
             Source::Hidden => {}
         };
 
@@ -1209,7 +1203,7 @@ impl<'a> Resolver<'a> {
             roots.push(qualifier);
         }
         for root in roots {
-            out.push(("*".to_owned(), vec![(root, "*".to_owned())]));
+            out.push((None, vec![(root, "*".to_owned())]));
         }
         out
     }
@@ -1231,8 +1225,8 @@ impl<'a> Resolver<'a> {
                 Expression::Column(column) => {
                     self.record_column(column, scope, clause, output);
                 }
-                Expression::Dot(_) => {
-                    self.record_dot(expression, scope, clause);
+                Expression::Dot(dot) => {
+                    self.record_dot(&dot.this, &dot.field, scope, clause);
                 }
                 _ => {
                     for child in expression.children() {
@@ -1274,7 +1268,7 @@ impl<'a> Resolver<'a> {
             }
             match expression {
                 Expression::Column(column) => self.record_column(column, scope, clause, None),
-                Expression::Dot(_) => self.record_dot(expression, scope, clause),
+                Expression::Dot(dot) => self.record_dot(&dot.this, &dot.field, scope, clause),
                 _ => {
                     let mut refs = Vec::new();
                     for child in expression.children() {
@@ -1339,21 +1333,61 @@ impl<'a> Resolver<'a> {
         }
         let refs = if qualifier.is_empty() {
             self.resolve_unqualified(&column.name, scope)
+        } else if let Some(refs) = Self::lookup_qualified(&qualifier, name, scope) {
+            refs
+        } else if let Some(field) = column.table.as_ref().filter(|id| self.has_named_column(scope, id)) {
+            // With a known schema, r.f may be a field of an unqualified row column r.
+            self.resolve_unqualified(field, scope)
         } else {
-            Self::resolve_qualified(&qualifier, name, scope)
+            Self::unresolved_qualified(&qualifier, name, scope)
         };
         self.add_refs(&refs, clause);
         refs
     }
 
-    fn record_dot(&mut self, expression: &Expression, scope: &Rc<Scope<'a>>, clause: Clause) -> Vec<ColRef> {
-        let Some((column, qualifier)) = dot_parts(expression) else {
-            return Vec::new();
-        };
-        if column.is_empty() {
-            return Vec::new();
+    fn record_dot(
+        &mut self,
+        mut base: &'a Expression,
+        field: &'a Identifier,
+        scope: &Rc<Scope<'a>>,
+        clause: Clause,
+    ) -> Vec<ColRef> {
+        let mut fields = vec![field];
+        while let Expression::Dot(dot) = base {
+            fields.push(&dot.field);
+            base = &dot.this;
         }
-        let refs = Self::resolve_qualified(&qualifier, &column, scope);
+        let Expression::Column(column) = base else {
+            // A field of a computed value depends on the inputs to that value.
+            return self.collect_refs(base, scope, clause);
+        };
+        fields.push(&column.name);
+        fields.extend(&column.table);
+        fields.reverse();
+
+        // Try the longest relation prefix first. In catalog.schema.t.r.f,
+        // catalog.schema.t may be the table and r the row-valued source column.
+        let mut qualifier = String::new();
+        let mut boundaries = Vec::new();
+        for identifier in &fields[..fields.len() - 1] {
+            boundaries.push(qualifier.len());
+            if !qualifier.is_empty() {
+                qualifier.push('.');
+            }
+            qualifier.push_str(&ident_key(identifier));
+        }
+        for (index, id) in fields.iter().enumerate().skip(1).rev() {
+            let end = boundaries.get(index).copied().unwrap_or(qualifier.len());
+            if let Some(refs) = Self::lookup_qualified(&qualifier[..end], &id.name, scope) {
+                self.add_refs(&refs, clause);
+                return refs;
+            }
+        }
+        let refs = if self.has_named_column(scope, fields[0]) {
+            self.resolve_unqualified(fields[0], scope)
+        } else {
+            Self::unresolved_qualified(&qualifier, &field.name, scope)
+        };
         self.add_refs(&refs, clause);
         refs
     }
@@ -1363,26 +1397,50 @@ impl<'a> Resolver<'a> {
     // -----------------------------------------------------------------------
 
     fn resolve_qualified(qualifier: &str, name: &str, scope: &Rc<Scope<'a>>) -> Vec<ColRef> {
+        Self::lookup_qualified(qualifier, name, scope)
+            .unwrap_or_else(|| Self::unresolved_qualified(qualifier, name, scope))
+    }
+
+    fn has_named_column(&self, scope: &Rc<Scope<'a>>, column: &Identifier) -> bool {
+        let found = scope.sources.borrow().iter().any(|source| match source.as_ref() {
+            Source::Physical {
+                columns: Some(columns), ..
+            } => self.schema.has_column(columns, column),
+            Source::Derived { out, .. } => out.refs(&column.name).is_some(),
+            _ => false,
+        });
+        found
+            || scope
+                .parent
+                .as_ref()
+                .is_some_and(|parent| self.has_named_column(parent, column))
+    }
+
+    fn lookup_qualified(qualifier: &str, name: &str, scope: &Rc<Scope<'a>>) -> Option<Vec<ColRef>> {
         let mut current = Some(scope.clone());
         while let Some(level) = current {
             let source = level.by_alias.borrow().get(qualifier).cloned();
             if let Some(source) = source {
-                return match source.as_ref() {
+                return Some(match source.as_ref() {
                     Source::Physical { table, .. } => vec![(table.clone(), name.to_owned())],
                     // A name missing from a derived output (an unexpanded
                     // star) is attributed to the derived source's roots.
                     Source::Derived { out, roots } => out.refs(name).cloned().unwrap_or_else(|| refs_for(roots, name)),
                     // Never registered under an alias; fail open regardless.
                     Source::Opaque | Source::Hidden => refs_for(&scope.chain_roots(), name),
-                };
+                });
             }
             let matched = level.matching_physical_tables(qualifier);
             if !matched.is_empty() {
                 let tables = matched.iter().flat_map(|source| source.roots()).collect::<Vec<_>>();
-                return refs_for(&tables, name);
+                return Some(refs_for(&tables, name));
             }
             current = level.parent.clone();
         }
+        None
+    }
+
+    fn unresolved_qualified(qualifier: &str, name: &str, scope: &Rc<Scope<'a>>) -> Vec<ColRef> {
         // Unknown qualifier: attribute to every table in scope.
         let roots = scope.chain_roots();
         if roots.is_empty() {
@@ -1426,7 +1484,7 @@ impl<'a> Resolver<'a> {
                     if let Some(found) = out.refs(name) {
                         bound = true;
                         refs.extend(found.iter().cloned());
-                    } else if out.by_name.contains_key("*") {
+                    } else if !out.wildcards.is_empty() {
                         // An unexpanded star may expose the name.
                         unknown.extend(roots.iter().cloned());
                     }

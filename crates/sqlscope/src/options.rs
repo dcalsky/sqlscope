@@ -79,7 +79,7 @@ impl fmt::Display for Dialect {
 ///
 /// | Setting | Read by |
 /// | --- | --- |
-/// | [`schema`](Options::schema) | [`column_origins`](crate::column_origins), [`output_columns`](crate::output_columns), [`referenced_columns`](crate::referenced_columns), [`column_usages`](crate::column_usages) |
+/// | [`schema`](Options::schema) | [`column_origins`](crate::column_origins), [`output_lineage`](crate::output_lineage), [`output_columns`](crate::output_columns), [`referenced_columns`](crate::referenced_columns), [`column_usages`](crate::column_usages) |
 /// | [`table_names`](Options::table_names), [`table_patterns`](Options::table_patterns), [`default_db`](Options::default_db) | [`apply_row_filter`](crate::apply_row_filter) |
 /// | [`strip_catalogs`](Options::strip_catalogs) | [`rewrite_tables`](crate::rewrite_tables) |
 ///

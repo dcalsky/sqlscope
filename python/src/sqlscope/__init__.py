@@ -8,6 +8,7 @@ apply_row_filter       Filter every in-scope table by a predicate.
 inject_ctes            Prepend CTE definitions to a query's root ``WITH``.
 rewrite_tables         Replace table references with other tables or derived tables.
 column_origins         Source columns whose values reach the result (lineage).
+output_lineage         Source columns for each query output.
 output_columns         Names of the columns a statement outputs.
 referenced_columns     Columns referenced anywhere, per table.
 column_usages          Column references with the clause they appear in.
@@ -42,11 +43,12 @@ from ._library import (
     load,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "Clause",
     "ColumnUsage",
+    "OutputColumnLineage",
     "CteDef",
     "Error",
     "InternalError",
@@ -67,6 +69,7 @@ __all__ = [
     "library_version",
     "load",
     "output_columns",
+    "output_lineage",
     "referenced_columns",
     "rewrite_tables",
     "transpile",
@@ -319,3 +322,19 @@ def column_usages(
         ColumnUsage(usage["table"], usage["column"], Clause(usage["clause"]))
         for usage in _run("column_usages", sql, dialect=dialect, schema=_schema(schema))
     ]
+
+
+@dataclass(frozen=True)
+class OutputColumnLineage:
+    """One projected column and its value sources grouped by physical table."""
+
+    name: str
+    sources: Dict[str, List[str]]
+
+
+def output_lineage(
+    sql: str, *, dialect: Optional[str] = None, schema: Optional[Schema] = None
+) -> Optional[List[OutputColumnLineage]]:
+    """Trace each query output in order. Statements without a source query return None."""
+    result = _run("output_lineage", sql, dialect=dialect, schema=_schema(schema))
+    return None if result is None else [OutputColumnLineage(**column) for column in result]

@@ -176,3 +176,11 @@ test("transpile", () => {
   assert.throws(() => sqlscope.transpile("SELECT ARRAY[1]", "trino", "mysql"), sqlscope.UnsupportedError);
   assert.deepEqual(sqlscope.transpile("SELECT ARRAY[1]", "trino", "mysql", "best_effort"), ["SELECT ARRAY(1)"]);
 });
+
+test("outputLineage preserves duplicate names and empty sources", () => {
+  assert.deepEqual(sqlscope.outputLineage("SELECT t.*, 1 AS x FROM t", { schema: { t: ["x"] } }), [
+    { name: "x", sources: { t: ["x"] } },
+    { name: "x", sources: {} },
+  ]);
+  assert.equal(sqlscope.outputLineage("DROP TABLE t"), null);
+});
