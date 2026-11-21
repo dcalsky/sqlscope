@@ -455,3 +455,14 @@ func TestTranspile(t *testing.T) {
 		t.Fatalf("Transpile: %v, %v", got, err)
 	}
 }
+
+func TestOutputLineage(t *testing.T) {
+	got, err := sqlscope.OutputLineage("SELECT t.*, 1 AS x FROM t", sqlscope.WithSchema(map[string][]string{"t": {"x"}}))
+	want := []sqlscope.OutputColumnLineage{
+		{Name: "x", Sources: map[string][]string{"t": {"x"}}},
+		{Name: "x", Sources: map[string][]string{}},
+	}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("OutputLineage = %#v, %v; want %#v", got, err, want)
+	}
+}

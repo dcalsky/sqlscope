@@ -8,6 +8,7 @@
 //! | [`inject_ctes`] | Prepend CTE definitions to a query's root `WITH`. |
 //! | [`rewrite_tables`] | Replace table references with derived tables. |
 //! | [`column_origins`] | Source columns whose values reach the result (column lineage). |
+//! | [`output_lineage`] | Source columns for each query output in projection order. |
 //! | [`output_columns`] | Names of the columns a statement outputs. |
 //! | [`referenced_columns`] | Columns referenced anywhere, per table. |
 //! | [`column_usages`] | Column references with the clause they appear in. |
@@ -29,7 +30,7 @@ mod row_filter;
 mod schema;
 mod transpile;
 
-pub use column_origins::column_origins;
+pub use column_origins::{column_origins, output_lineage, OutputColumnLineage};
 pub use column_usages::{column_usages, referenced_columns, Clause, ColumnUsage};
 pub use error::{Error, ErrorKind, Result};
 pub use inject_ctes::{inject_ctes, CteDef};

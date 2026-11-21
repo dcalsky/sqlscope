@@ -17,6 +17,7 @@ npm install sqlscope-rs
 | `injectCtes` | Prepend CTE definitions to a query's root `WITH`. |
 | `rewriteTables` | Replace table references with other tables or derived tables. |
 | `columnOrigins` | Source columns whose values reach the result (column lineage). |
+| `outputLineage` | Source columns for each query output in projection order. |
 | `outputColumns` | Names of the columns a statement outputs. |
 | `referencedColumns` | Columns referenced anywhere (filters included), per table. |
 | `columnUsages` | Column references together with the clause they appear in. |
@@ -57,7 +58,7 @@ Every function is synchronous. Options:
 | Option | Read by |
 | --- | --- |
 | `dialect` | all (default `"trino"`; `"postgres"`, `"mysql"`, `"spark"`, `"snowflake"`, `"bigquery"`, ...) |
-| `schema` | `columnOrigins`, `outputColumns`, `referencedColumns`, `columnUsages` |
+| `schema` | `columnOrigins`, `outputLineage`, `outputColumns`, `referencedColumns`, `columnUsages` |
 | `tableNames`, `tablePatterns`, `defaultDb` | `applyRowFilter` |
 | `stripCatalogs` | `rewriteTables` |
 

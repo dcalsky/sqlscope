@@ -171,3 +171,14 @@ func ColumnUsages(sql string, opts ...Option) ([]ColumnUsage, error) {
 	}
 	return usages, err
 }
+
+// OutputColumnLineage groups one projected column's value sources by physical table.
+type OutputColumnLineage struct {
+	Name    string              `json:"name"`
+	Sources map[string][]string `json:"sources"`
+}
+
+// OutputLineage returns one entry per projection in order, or nil for statements without a query.
+func OutputLineage(sql string, opts ...Option) ([]OutputColumnLineage, error) {
+	return run[[]OutputColumnLineage]("output_lineage", map[string]any{"sql": sql}, opts)
+}

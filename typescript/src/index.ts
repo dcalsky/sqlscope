@@ -8,6 +8,7 @@
  * | {@link injectCtes} | Prepend CTE definitions to a query's root `WITH`. |
  * | {@link rewriteTables} | Replace table references with other tables or derived tables. |
  * | {@link columnOrigins} | Source columns whose values reach the result (lineage). |
+ * | {@link outputLineage} | Source columns for each query output. |
  * | {@link outputColumns} | Names of the columns a statement outputs. |
  * | {@link referencedColumns} | Columns referenced anywhere, per table. |
  * | {@link columnUsages} | Column references with the clause they appear in. |

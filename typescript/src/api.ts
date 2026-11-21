@@ -251,3 +251,14 @@ export function referencedColumns(sql: string, options: SchemaOptions = {}): Rec
 export function columnUsages(sql: string, options: SchemaOptions = {}): ColumnUsage[] {
   return analyze("column_usages", sql, options) as ColumnUsage[];
 }
+
+/** One projected column and its value sources grouped by physical table. */
+export interface OutputColumnLineage {
+  name: string;
+  sources: Record<string, string[]>;
+}
+
+/** Trace each query output in order. Statements without a source query return null. */
+export function outputLineage(sql: string, options: SchemaOptions = {}): OutputColumnLineage[] | null {
+  return analyze("output_lineage", sql, options) as OutputColumnLineage[] | null;
+}

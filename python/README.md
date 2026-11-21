@@ -26,6 +26,9 @@ sqlscope.column_origins(
     "SELECT o.id, p.amount FROM orders o JOIN payments p ON o.id = p.order_id WHERE o.status = 'PAID'"
 )
 # {'orders': ['id'], 'payments': ['amount']}
+
+sqlscope.output_lineage("SELECT price AS unit_price, price * qty AS total FROM orders")[1]
+# OutputColumnLineage(name='total', sources={'orders': ['price', 'qty']})
 ```
 
 See the [project README](https://github.com/dcalsky/sqlscope#readme) for the

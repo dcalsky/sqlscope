@@ -9,7 +9,7 @@
  * with kind one of "invalid_argument", "parse", "unsupported", "internal".
  *
  * Operations: apply_row_filter, inject_ctes, rewrite_tables, column_origins,
- * output_columns, referenced_columns, column_usages. The request is
+ * output_lineage, output_columns, referenced_columns, column_usages. The request is
  *
  *   {"sql": "...", "predicate": "...", "ctes": [{"name", "query"}],
  *    "rewrites": [{"matchKey", "inline": TableRef, "union": {"tableAlias",
@@ -18,6 +18,8 @@
  *    "tablePatterns", "defaultDb", "stripCatalogs"}}
  *
  * where TableRef is {"table", "schema", "catalog"}; only "sql" is required.
+ * output_lineage returns [{"name":"...", "sources":{"table":["column"]}}] in
+ * projection order, or null for statements without a source query.
  * The transpile operation takes {"sql":"...", "source":"trino", "target":"starrocks",
  * "mode":"strict"} and returns an array of statements. Targets are starrocks
  * and mysql. Optional mode is strict (default) or best_effort.

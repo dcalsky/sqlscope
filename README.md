@@ -10,6 +10,7 @@ Scope-aware SQL analysis and rewriting for Rust, Python, Go and TypeScript, buil
 | `inject_ctes` | Prepend CTE definitions to a query's root `WITH`. |
 | `rewrite_tables` | Replace table references with other tables or derived tables. |
 | `column_origins` | Source columns whose values reach the result (column lineage). |
+| `output_lineage` | Source columns for each query output, in projection order. |
 | `output_columns` | Names of the columns a statement outputs. |
 | `referenced_columns` | Columns referenced anywhere (filters included), per table. |
 | `column_usages` | Column references together with the clause they appear in. |
@@ -36,7 +37,7 @@ library in the Python package directory (Python) or next to the executable
 
 | Language | Package |
 | --- | --- |
-| Rust | `cargo add --git https://github.com/dcalsky/sqlscope --tag v0.7.0 sqlscope` |
+| Rust | `cargo add --git https://github.com/dcalsky/sqlscope --tag v0.8.0 sqlscope` |
 | C / C++ / others | link `sqlscope-ffi` from a release; see `sqlscope.h` |
 | Python | `pip install sqlscope-rs` (imported as `sqlscope`; pure Python, ≥ 3.9) |
 | Go | `go get github.com/dcalsky/sqlscope/go` (no cgo; uses [purego](https://github.com/ebitengine/purego)) |
@@ -137,7 +138,7 @@ Analysis and scoped rewriting operations share the following options.
 | Rust (`Options::`) | Python keyword | Go | TypeScript option | Read by |
 | --- | --- | --- | --- | --- |
 | `dialect` | `dialect` | `WithDialect` | `dialect` | analysis and scoped rewriting (default `trino`) |
-| `schema` | `schema` | `WithSchema` | `schema` | `column_origins`, `output_columns`, `referenced_columns`, `column_usages` |
+| `schema` | `schema` | `WithSchema` | `schema` | `column_origins`, `output_lineage`, `output_columns`, `referenced_columns`, `column_usages` |
 | `table_names` | `table_names` | `WithTableNames` | `tableNames` | `apply_row_filter` |
 | `table_patterns` | `table_patterns` | `WithTableRegexp` | `tablePatterns` | `apply_row_filter` |
 | `default_db` | `default_db` | `WithDefaultDB` | `defaultDb` | `apply_row_filter` |
@@ -231,6 +232,26 @@ Filter-only positions (`WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, top-level
 `ORDER BY`) and the right side of `INTERSECT`/`EXCEPT` are excluded; window
 `PARTITION BY`/`ORDER BY` count. Accepts `CREATE VIEW`, `CREATE TABLE AS`,
 `INSERT ... SELECT` and friends, and the assigned values of `UPDATE`/`MERGE`.
+
+### `output_lineage(sql)`
+
+Returns one entry per query output, in order, including duplicate names. For
+`SELECT price AS unit_price, price * qty AS total FROM orders`, the JSON result is
+
+```json
+[
+  {"name":"unit_price","sources":{"orders":["price"]}},
+  {"name":"total","sources":{"orders":["price","qty"]}}
+]
+```
+
+Sources are distinct and sorted within each physical table. Constants have
+empty sources. Value flow follows CTEs, subqueries, windows and set operations.
+Unaliased expressions are named `_col{i}`. A wildcard of unknown width is
+represented by `*`. Supply a schema when matching wildcard positions in a
+union or explicit column list. Query-bearing views, CTAS and inserts use
+explicit target names when supplied. Statements without a source query
+return `null`.
 
 ### `output_columns(sql)`
 
